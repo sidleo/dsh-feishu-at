@@ -1,0 +1,7 @@
+# dsh-feishu-at 的 bundle patch：在 profile 插件树里插入本插件的一行。
+# 落点是 Host 半（index.js，注册 /api/dsh-feishu-at/* 路由）+ Client 半（client.js，
+# 往 input-trigger 流水线注册 '@' 来源）。
+- insert:
+    - id: feishu-at
+      name: '@sidleo3/dsh-feishu-at'
+      config: {}

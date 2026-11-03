@@ -1,0 +1,79 @@
+# dsh-feishu-at · 飞书 @ 提及
+
+在 DSH Web GUI 的输入框里敲 `@`，直接模糊搜索并选择**飞书用户 / 群聊 / 部门**：
+
+- `@` 后继续输入即按字符模糊搜索（服务端关键字搜索 + 菜单实时过滤）；
+- 选中后插入一个原子 @ 块，**默认显示名称**（块不可拆字编辑，删一次删整块）；
+- 发送给模型时，块被序列化为带 **名称 + ID + ID 类型** 的文本，例如：
+  - `@张三（飞书用户，open_id=ou_xxxx…）`
+  - `@项目协作群（飞书群聊，chat_id=oc_xxxx…）`
+  - `@测试部门（飞书部门，open_department_id=od-xxxx…）`
+- 一敲 `@`（还没输入字符）时先展示**最近群聊**，回车即可选中；
+- 候选按「飞书用户 / 飞书群聊 / 飞书部门」分节，行尾显示 ID 类型 + ID，方便区分同名用户。
+
+## 前置条件
+
+| 依赖 | 说明 |
+|------|------|
+| DSH `>= 0.2.1-rc.3` | 依赖内置的输入触发流水线（`dsh-client-ui-input-trigger`）与 `webServer` 路由 |
+| `lark-cli`（本机 `~/.local/bin/lark-cli`） | 已用 **user 身份**登录：`lark-cli auth login`。插件会自动在 PATH 之外回退查找 `~/.local/bin`、`/opt/homebrew/bin`、`/usr/local/bin` |
+| 部门名称（可选） | 部门名称要 `contact:department.base:readonly` 读权限（`--domain contact` 不含它）。执行 `lark-cli auth login --scope contact:department.base:readonly` 授权后重载插件即可；未授权时部门行只显示 `open_department_id` |
+
+## 安装
+
+```bash
+# 从 npm 装（推荐）
+dsh plugin --profile desktop add @sidleo3/dsh-feishu-at
+
+# 或从仓库装（开发用，link 到本地目录）
+dsh plugin --profile desktop add link:/绝对路径/dsh-feishu-at
+```
+
+安装后重启 DSH 加载 Host 半，并刷新浏览器页面加载 Client 半。
+若 profile 用显式 bundles 清单（`package.json` → `dsh.profile.bundles`），把 `@sidleo3/dsh-feishu-at` 加进去。
+
+## 使用
+
+1. 在会话输入框敲 `@`；菜单出现「最近群聊」。
+2. 继续输入，例如 `@张`、`@有货`、`@商品`，候选按用户/群聊/部门分节出现。
+3. `↑/↓` 或鼠标选择，`Enter` 或 `Tab` 选中；`Esc` 关闭。选中后输入框里是 `@名称` 块。
+4. 正常发送。模型收到的是带 ID 与 ID 类型的文本，可直接据此用 `lark-cli` 发消息、查群、查部门成员等。
+
+> 搜索走 `lark-cli contact +search-user` / `lark-cli im +chat-search` / 原生 `contact/v3/departments/search`。
+> 每条命令约 0.8–1.5s，插件在 Host 侧做了 120s 结果缓存与并发去重，重复前缀（如先 `张` 再 `张志`）会很快；首次搜索稍慢属正常。
+
+## 配置（可选，profile 的 `cordis.patch.yml`）
+
+```yaml
+- id: feishu-at
+  config:
+    larkCliPath: ~/.local/bin/lark-cli  # 缺省自动探测
+    identity: user                                   # 目前只支持 user
+    timeoutMs: 8000                                  # 单条 lark-cli 超时
+    cacheTtlMs: 120000                               # 搜索结果缓存 TTL
+```
+
+## 实现结构
+
+```
+index.js        Host 半：execFile 调 lark-cli → /api/dsh-feishu-at/search|status（内存缓存 + 并发去重 + 权限降级）
+client.js       Client 半：向 ctx.inputTriggers 注册 '@' 来源，同源 fetch Host 路由，插引用块、提交时按 codec 序列化
+cordis.patch.yml  bundle patch：插入 id=feishu-at 一行
+locale/*.json   Plugin Manager / 设置页显示用的标题与描述
+icon.svg        插件图标
+```
+
+- Host 路由：`GET /api/dsh-feishu-at/search?q=&types=user,chat,dept&limit=8`、`GET /api/dsh-feishu-at/status`。
+  `/status` 的 `lastRequests` 是最近 20 条请求的观测（时间 / q / User-Agent / Referer），可用来确认浏览器半是否真的在调路由。
+- Client 只依赖 baseline 的 `react` 模块，无构建步骤、无 npm 依赖。
+- 引用块 `appearance` 省略 → 输入框内显示 `@` + 名称；发送时按 `source:'feishu'` 路由到本插件的 `codec.serialize`。
+
+## 排障
+
+| 现象 | 处理 |
+|------|------|
+| 敲 `@` 只有文件/会话，没有飞书分组 | `curl -s 'http://127.0.0.1:<DSH Web 端口>/api/dsh-feishu-at/status'` 看 `cli.found` / `auth.ready`；Host 半改动需重启 DSH 才生效 |
+| `cli.found=false` | 装好 lark-cli 或在配置里指定 `larkCliPath` |
+| `auth.ready=false` | `lark-cli auth login`（user 身份） |
+| 部门行只显示 `od-…` | `lark-cli auth login --scope contact:department.base:readonly` 授权后重载本插件（插件页关一下再开）或重启 DSH |
+| 首次搜索慢 | lark-cli 每次冷启动 ~1s；插件缓存 120s，属预期 |

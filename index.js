@@ -1,0 +1,592 @@
+/**
+ * dsh-feishu-at —— Host 半。
+ *
+ * 职责：用本机 `lark-cli`（user 身份）搜索飞书「用户 / 群聊 / 部门」，经
+ * `GET /api/dsh-feishu-at/search`、`GET /api/dsh-feishu-at/status` 两个同源路由
+ * 提供给浏览器半（client.js），后者把它注册成输入框的 `@` 候选来源。
+ *
+ * 设计要点：
+ * - **进程 PATH 不可信**：macOS 上从 Dock/Finder 启动的 GUI 进程 PATH 只有
+ *   `/usr/bin:/bin:/usr/sbin:/sbin`，直接 `spawn('lark-cli')` 会 ENOENT；这里照
+ *   dsh-wiki 的做法探测 `~/.local/bin`、`/opt/homebrew/bin`、`/usr/local/bin`，
+ *   并给子进程补上 lark-cli 所在目录（它常是 `#!/usr/bin/env node` 的 shim）。
+ * - **交互性能**：每条 lark-cli 约 0.8–1.5s。三路并行 + 内存 TTL 缓存 + 同 key
+ *   并发去重，避免每敲一个字都冷启动三次。
+ * - **永不 500**：搜索路由任何失败都返回 200 + 空 items + warnings，菜单侧静默降级。
+ * - **权限降级**：当前 user token 没有「部门基础信息」读权限（`contact:department.base:readonly`），
+ *   部门搜索只回 `open_department_id`。探测一次后缓存结论，按 id 降级返回并提示授权命令。
+ */
+
+import { execFile } from 'node:child_process'
+import { accessSync, constants } from 'node:fs'
+import { homedir } from 'node:os'
+import { dirname, join } from 'node:path'
+
+/** 插件行 id（与 cordis.patch.yml 的 id 一致）。 */
+export const name = 'feishu-at'
+/** 需要 webServer 才能注册路由；非 Web 部署下本插件不激活。 */
+export const inject = ['webServer']
+
+const ROUTES = {
+  search: '/api/dsh-feishu-at/search',
+  status: '/api/dsh-feishu-at/status',
+}
+
+const DEFAULT_TIMEOUT_MS = 8000
+const DEFAULT_CACHE_TTL_MS = 120_000
+const STATUS_CACHE_TTL_MS = 30_000
+const RECENT_CACHE_TTL_MS = 60_000
+const DEPT_NAMES_TTL_MS = 10 * 60_000
+const MAX_CACHE_ENTRIES = 200
+const MAX_QUERY_LENGTH = 50
+const MAX_LIMIT = 20
+const TYPES = new Set(['user', 'chat', 'dept'])
+
+const DEPT_SCOPE_HINT = '部门名称无权限：执行 `lark-cli auth login --scope contact:department.base:readonly` 授权后重载插件（或重启 DSH）'
+const LARK_MISSING_HINT = '未找到 lark-cli：安装后执行 `lark-cli auth login`，或在插件 config 里指定 larkCliPath'
+
+// ───────────────────────────── lark-cli 进程 ─────────────────────────────
+
+/**
+ * lark-cli 落点候选（PATH 里没有时的回退）。
+ * @returns {string[]} 绝对路径候选
+ */
+function larkCandidates() {
+  return [
+    join(homedir(), '.local', 'bin', 'lark-cli'),
+    '/opt/homebrew/bin/lark-cli',
+    '/usr/local/bin/lark-cli',
+  ]
+}
+
+/**
+ * 可执行文件存在且可执行？（避免挑到无 +x 的残文件后报 EACCES 而非 ENOENT）
+ * @param {string} path
+ * @returns {boolean}
+ */
+function runnable(path) {
+  try {
+    accessSync(path, constants.X_OK)
+    return true
+  } catch {
+    return false
+  }
+}
+
+/**
+ * 解析 lark-cli 可执行文件与子进程需要的 PATH。
+ * @param {string|undefined} explicit - 配置里显式指定的路径
+ * @returns {{bin: string, path: string|null, found: boolean}}
+ */
+function resolveLarkCli(explicit) {
+  if (explicit) return { bin: explicit, path: null, found: runnable(explicit) }
+  const path = String(process.env.PATH || '')
+  if (path.split(':').filter(Boolean).some((dir) => runnable(join(dir, 'lark-cli')))) {
+    return { bin: 'lark-cli', path: null, found: true }
+  }
+  for (const candidate of larkCandidates()) {
+    if (!runnable(candidate)) continue
+    const dir = dirname(candidate)
+    const nextPath = path.split(':').includes(dir) ? null : [dir, path].filter(Boolean).join(':')
+    return { bin: candidate, path: nextPath, found: true }
+  }
+  return { bin: 'lark-cli', path: null, found: false }
+}
+
+/** 把 stdout 解析成 JSON；不是 JSON 时返回 null。 */
+function tryJson(text) {
+  const trimmed = String(text || '').trim()
+  if (!trimmed.startsWith('{') && !trimmed.startsWith('[')) return null
+  try {
+    return JSON.parse(trimmed)
+  } catch {
+    return null
+  }
+}
+
+/**
+ * 执行一条 lark-cli 命令；永不 reject。
+ * @param {string[]} args
+ * @param {{bin?: string, timeoutMs?: number, envPath?: string|null}} opts
+ * @returns {Promise<{ok: boolean, json: any, error?: string}>}
+ */
+function runLark(args, opts = {}) {
+  const timeoutMs = Number.isFinite(opts.timeoutMs) ? opts.timeoutMs : DEFAULT_TIMEOUT_MS
+  return new Promise((resolve) => {
+    const lark = resolveLarkCli(opts.bin)
+    if (!lark.found) {
+      resolve({ ok: false, json: null, error: LARK_MISSING_HINT, missing: true })
+      return
+    }
+    execFile(
+      lark.bin,
+      args,
+      {
+        timeout: timeoutMs,
+        maxBuffer: 32 * 1024 * 1024,
+        shell: false,
+        env: lark.path === null ? { ...process.env } : { ...process.env, PATH: lark.path },
+      },
+      (err, stdout, stderr) => {
+        const out = String(stdout || '')
+        const errText = String(stderr || '')
+        if (!err) {
+          resolve({ ok: true, json: tryJson(out) })
+          return
+        }
+        const code = typeof err.code === 'number' ? err.code : null
+        if (err.code === 'ENOENT') {
+          resolve({ ok: false, json: null, error: LARK_MISSING_HINT })
+          return
+        }
+        if (err.killed || code === null) {
+          resolve({ ok: false, json: null, error: `lark-cli 执行超时（${timeoutMs}ms）：${args.slice(0, 3).join(' ')}` })
+          return
+        }
+        resolve({
+          ok: false,
+          json: tryJson(out),
+          error: (errText || out || `lark-cli ${args.slice(0, 3).join(' ')} 失败（exit ${code}）`).trim().slice(0, 500),
+        })
+      },
+    )
+  })
+}
+
+/**
+ * 解包 lark-cli 的 `{ok, data}` 信封。
+ * @param {{ok: boolean, json: any, error?: string}} res
+ * @returns {{ok: boolean, data?: any, error?: string}}
+ */
+function unwrap(res) {
+  if (!res.ok) return { ok: false, error: res.error || 'lark-cli 执行失败' }
+  const json = res.json
+  if (json && json.ok === false) {
+    const err = json.error
+    const message = err && (err.message || err.type) ? String(err.message || err.type) : 'lark-cli 返回失败'
+    return { ok: false, error: message }
+  }
+  if (json && typeof json === 'object' && 'data' in json) return { ok: true, data: json.data }
+  return { ok: false, error: 'lark-cli 返回格式异常' }
+}
+
+// ───────────────────────────── 缓存 ─────────────────────────────
+
+/** 极简 TTL + LRU 缓存（key → {at, ttl, value}），并做同 key 并发去重。 */
+class TimedCache {
+  constructor(maxEntries = MAX_CACHE_ENTRIES) {
+    this.maxEntries = maxEntries
+    this.map = new Map()
+    this.inflight = new Map()
+  }
+
+  /**
+   * 取缓存；未命中时执行 loader（同 key 并发共用一次 loader）。
+   * @param {string} key
+   * @param {number} ttl
+   * @param {() => Promise<any>} loader
+   * @returns {Promise<any>}
+   */
+  async get(key, ttl, loader) {
+    const now = Date.now()
+    const hit = this.map.get(key)
+    if (hit && now - hit.at < hit.ttl) return hit.value
+    if (this.inflight.has(key)) return this.inflight.get(key)
+    const pending = (async () => {
+      try {
+        const value = await loader()
+        this.map.set(key, { at: Date.now(), ttl, value })
+        while (this.map.size > this.maxEntries) this.map.delete(this.map.keys().next().value)
+        return value
+      } finally {
+        this.inflight.delete(key)
+      }
+    })()
+    this.inflight.set(key, pending)
+    return pending
+  }
+
+  /** 清空（测试/调试用）。 */
+  clear() {
+    this.map.clear()
+    this.inflight.clear()
+  }
+}
+
+// ───────────────────────────── 三个搜索域 ─────────────────────────────
+
+/** 配置归一化。 */
+function normalizeConfig(config) {
+  const cfg = config && typeof config === 'object' ? config : {}
+  return {
+    larkCliPath: typeof cfg.larkCliPath === 'string' && cfg.larkCliPath ? cfg.larkCliPath : undefined,
+    timeoutMs: Number.isFinite(cfg.timeoutMs) ? cfg.timeoutMs : DEFAULT_TIMEOUT_MS,
+    cacheTtlMs: Number.isFinite(cfg.cacheTtlMs) ? cfg.cacheTtlMs : DEFAULT_CACHE_TTL_MS,
+    identity: 'user',
+  }
+}
+
+/** 截断部门路径，只留末两级（如「测试部门-分部」）。 */
+function departmentTail(department) {
+  const text = String(department || '').trim()
+  if (!text) return ''
+  const parts = text.split(/[-/]/).filter(Boolean)
+  return parts.slice(-2).join('-')
+}
+
+/** 用户候选。 */
+async function searchUsers(q, limit, cfg) {
+  const res = await runLark(
+    ['contact', '+search-user', '--query', q, '--as', cfg.identity, '--format', 'json', '--page-size', String(Math.min(Math.max(limit, 1), 30))],
+    { bin: cfg.larkCliPath, timeoutMs: cfg.timeoutMs },
+  )
+  const unwrapped = unwrap(res)
+  if (!unwrapped.ok) return { items: [], error: unwrapped.error }
+  const users = Array.isArray(unwrapped.data?.users) ? unwrapped.data.users : []
+  const items = []
+  for (const user of users) {
+    const displayName = String(user.localized_name || '').trim()
+    if (!displayName) continue
+    const department = String(user.department || '').trim()
+    const tail = departmentTail(department)
+    items.push({
+      type: 'user',
+      name: displayName,
+      id: String(user.open_id || ''),
+      idType: 'open_id',
+      description: tail ? `${tail} · open_id ${user.open_id || ''}` : `open_id ${user.open_id || ''}`,
+      department,
+    })
+    if (items.length >= limit) break
+  }
+  return { items }
+}
+
+/** 群聊候选。 */
+function mapChat(chat) {
+  const displayName = String(chat.name || '').trim()
+  if (!displayName) return null
+  const description = String(chat.description || '').trim()
+  const external = chat.external === true ? '外部群 · ' : ''
+  return {
+    type: 'chat',
+    name: displayName,
+    id: String(chat.chat_id || ''),
+    idType: 'chat_id',
+    description: `${external}${description ? `${description.slice(0, 40)} · ` : ''}chat_id ${chat.chat_id || ''}`,
+  }
+}
+
+/** 按关键字搜索群聊。 */
+async function searchChats(q, limit, cfg) {
+  const res = await runLark(
+    ['im', '+chat-search', '--query', q, '--as', cfg.identity, '--format', 'json', '--page-size', String(Math.min(Math.max(limit, 1), 30))],
+    { bin: cfg.larkCliPath, timeoutMs: cfg.timeoutMs },
+  )
+  const unwrapped = unwrap(res)
+  if (!unwrapped.ok) return { items: [], error: unwrapped.error }
+  const chats = Array.isArray(unwrapped.data?.chats) ? unwrapped.data.chats : []
+  const items = chats.map(mapChat).filter(Boolean).slice(0, limit)
+  return { items }
+}
+
+/** 最近群聊（`@` 刚敲出来、q 为空时用）。 */
+async function recentChats(limit, cfg) {
+  const res = await runLark(
+    ['im', '+chat-list', '--types', 'group', '--sort', 'active_time', '--page-size', String(Math.min(Math.max(limit, 1), 50)), '--as', cfg.identity, '--format', 'json'],
+    { bin: cfg.larkCliPath, timeoutMs: cfg.timeoutMs },
+  )
+  const unwrapped = unwrap(res)
+  if (!unwrapped.ok) return { items: [], error: unwrapped.error }
+  const data = unwrapped.data
+  const chats = Array.isArray(data?.chats) ? data.chats : Array.isArray(data?.items) ? data.items : []
+  const items = chats
+    .map(mapChat)
+    .filter(Boolean)
+    .map((item) => ({ ...item, section: '最近群聊' }))
+    .slice(0, limit)
+  return { items }
+}
+
+/**
+ * 部门候选。部门名需要 `contact:department.base:readonly`：
+ * 先探测一次，无权限就整片按 id 降级，避免每次搜索都打 N 条 detail 请求。
+ */
+async function searchDepartments(q, limit, cfg, state) {
+  const res = await runLark(
+    ['api', 'POST', '/open-apis/contact/v3/departments/search', '--data', JSON.stringify({ query: q, page_size: Math.min(Math.max(limit, 1), 50) })],
+    { bin: cfg.larkCliPath, timeoutMs: cfg.timeoutMs },
+  )
+  const unwrapped = unwrap(res)
+  if (!unwrapped.ok) return { items: [], error: unwrapped.error }
+  const raw = Array.isArray(unwrapped.data?.items) ? unwrapped.data.items : []
+  const rows = raw
+    .map((row) => ({
+      id: String(row.open_department_id || ''),
+      name: typeof row.name === 'string' && row.name.trim() ? row.name.trim() : null,
+      memberCount: Number.isFinite(row.member_count) ? row.member_count : undefined,
+    }))
+    .filter((row) => row.id)
+    .slice(0, limit)
+  if (rows.length === 0) return { items: [] }
+
+  const warnings = []
+  const allNamed = rows.every((row) => row.name !== null)
+  let namesAvailable = state.deptNames.value
+  if (allNamed) {
+    // 授权后搜索接口直接带 name：一次调用即可，省掉逐条 detail。
+    namesAvailable = true
+    state.deptNames.value = true
+    state.deptNames.at = Date.now()
+  } else if (namesAvailable === undefined) {
+    namesAvailable = await probeDepartmentNames(rows[0].id, cfg)
+    state.deptNames.value = namesAvailable
+    state.deptNames.at = Date.now()
+  }
+  if (namesAvailable === false) warnings.push(DEPT_SCOPE_HINT)
+
+  /** 部门行描述：成员数（有则带）+ ID。 */
+  const describe = (row) => {
+    const parts = []
+    if (typeof row.memberCount === 'number') parts.push(`${row.memberCount} 人`)
+    parts.push(`open_department_id ${row.id}`)
+    return parts.join(' · ')
+  }
+
+  const items = []
+  for (const row of rows) {
+    let name = row.name
+    if (!name && namesAvailable) name = await fetchDepartmentName(row.id, cfg)
+    items.push({
+      type: 'dept',
+      name: name || row.id,
+      id: row.id,
+      idType: 'open_department_id',
+      description: name ? describe(row) : `open_department_id ${row.id}（名称需授权）`,
+      ...(name ? {} : { nameAuthorized: false }),
+    })
+  }
+  return { items, warnings }
+}
+
+/** 探测部门详情里是否带 name（一次调用即可确定整片权限）。 */
+async function probeDepartmentNames(id, cfg) {
+  return (await fetchDepartmentName(id, cfg)) !== null
+}
+
+/** 取单个部门名称；无权限/失败返回 null。 */
+async function fetchDepartmentName(id, cfg) {
+  const res = await runLark(
+    ['api', 'GET', `/open-apis/contact/v3/departments/${id}`, '--params', JSON.stringify({ department_id_type: 'open_department_id' })],
+    { bin: cfg.larkCliPath, timeoutMs: cfg.timeoutMs },
+  )
+  const unwrapped = unwrap(res)
+  if (!unwrapped.ok) return null
+  const departmentName = unwrapped.data?.department?.name
+  return typeof departmentName === 'string' && departmentName.trim() ? departmentName.trim() : null
+}
+
+// ───────────────────────────── 对外检索 / 状态 ─────────────────────────────
+
+/** 每进程一份缓存与部门权限结论。 */
+const searchCache = new TimedCache()
+const statusCache = new TimedCache()
+const state = { deptNames: { value: undefined, at: 0 } }
+/** 最近请求观察（调试：确认浏览器半是否真的在调本插件路由），最多 20 条。 */
+const requestLog = []
+
+/** 记录一条请求（防观测日志无限增长）。 */
+function recordRequest(req, extra) {
+  try {
+    const headers = req && req.headers ? req.headers : {}
+    requestLog.push({
+      at: Date.now(),
+      ...extra,
+      ua: String(headers['user-agent'] || '').slice(0, 120),
+      referer: String(headers.referer || '').slice(0, 120),
+    })
+    while (requestLog.length > 20) requestLog.shift()
+  } catch {
+    /* 观测失败不影响主流程 */
+  }
+}
+
+/** 部门名结论过期后重新探测。 */
+function deptNamesValue() {
+  if (state.deptNames.value === undefined) return null
+  if (Date.now() - state.deptNames.at > DEPT_NAMES_TTL_MS) return null
+  return state.deptNames.value
+}
+
+/**
+ * 搜索入口（路由与测试共用；永不 reject）。
+ * @param {{q?: string, types?: string, limit?: number}} params
+ * @param {object} cfg - normalizeConfig 的结果
+ * @returns {Promise<{ok: true, q: string, items: any[], warnings: string[], recent?: boolean}>}
+ */
+export async function searchFeishu(params, cfg) {
+  const q = String(params.q || '').trim().slice(0, MAX_QUERY_LENGTH)
+  const limit = Number.isFinite(params.limit) ? Math.min(Math.max(Math.trunc(params.limit), 1), MAX_LIMIT) : 8
+  const requestedTypes = String(params.types || 'user,chat,dept')
+    .split(',')
+    .map((type) => type.trim())
+    .filter((type) => TYPES.has(type))
+  const types = requestedTypes.length ? requestedTypes : ['user', 'chat', 'dept']
+
+  if (!q) {
+    try {
+      return await searchCache.get(`recent|${limit}`, RECENT_CACHE_TTL_MS, async () => {
+        const recent = await recentChats(limit, cfg)
+        return {
+          ok: true,
+          q: '',
+          recent: true,
+          items: recent.items || [],
+          warnings: recent.error ? [recent.error] : [],
+        }
+      })
+    } catch (error) {
+      return { ok: true, q: '', recent: true, items: [], warnings: [String(error?.message || error)] }
+    }
+  }
+
+  const key = `search|${q}|${types.join(',')}|${limit}`
+  try {
+    return await searchCache.get(key, cfg.cacheTtlMs, async () => {
+      const jobs = []
+      if (types.includes('user')) jobs.push(searchUsers(q, limit, cfg))
+      if (types.includes('chat')) jobs.push(searchChats(q, limit, cfg))
+      if (types.includes('dept')) jobs.push(searchDepartments(q, limit, cfg, state))
+      const settled = await Promise.allSettled(jobs)
+      const items = []
+      const warnings = []
+      for (const result of settled) {
+        if (result.status === 'rejected') {
+          warnings.push(String(result.reason?.message || result.reason))
+          continue
+        }
+        items.push(...(result.value.items || []))
+        warnings.push(...(result.value.warnings || []))
+        if (result.value.error) warnings.push(result.value.error)
+      }
+      const order = { user: 0, chat: 1, dept: 2 }
+      items.sort((a, b) => (order[a.type] ?? 9) - (order[b.type] ?? 9))
+      return { ok: true, q, items, warnings: [...new Set(warnings.filter(Boolean))] }
+    })
+  } catch (error) {
+    return { ok: true, q, items: [], warnings: [String(error?.message || error)] }
+  }
+}
+
+/**
+ * 插件状态（路由与测试共用；永不 reject）。
+ * @param {object} cfg
+ * @returns {Promise<object>}
+ */
+export async function feishuStatus(cfg) {
+  try {
+    return await statusCache.get('status', STATUS_CACHE_TTL_MS, async () => {
+      const lark = resolveLarkCli(cfg.larkCliPath)
+      const result = await runLark(['auth', 'status'], { bin: cfg.larkCliPath, timeoutMs: cfg.timeoutMs })
+      const warnings = []
+      let auth = { ready: false, identity: null, userName: null, openId: null }
+      const json = result.json
+      if (result.ok && json && typeof json === 'object') {
+        const user = json.identities && json.identities.user
+        auth = {
+          ready: user?.status === 'ready',
+          identity: json.identity ?? null,
+          userName: user?.userName ?? null,
+          openId: user?.openId ?? null,
+        }
+      } else {
+        warnings.push(result.error || 'lark-cli auth status 执行失败')
+      }
+      const departmentNames = deptNamesValue()
+      if (departmentNames === false) warnings.push(DEPT_SCOPE_HINT)
+      return { ok: true, cli: { found: lark.found, bin: lark.found ? lark.bin : null }, auth, departmentNames, warnings }
+    })
+  } catch (error) {
+    return { ok: true, cli: { found: false, bin: null }, auth: { ready: false }, departmentNames: null, warnings: [String(error?.message || error)] }
+  }
+}
+
+// ───────────────────────────── HTTP 路由 ─────────────────────────────
+
+/** 写 JSON 响应。 */
+function jsonResponse(res, body, code = 200) {
+  const text = JSON.stringify(body)
+  res.writeHead(code, {
+    'content-type': 'application/json; charset=utf-8',
+    'cache-control': 'no-store',
+    'content-length': Buffer.byteLength(text),
+  })
+  res.end(text)
+}
+
+/** 绑定注册动作到当前 fiber（宿主卸载/热替换时自动释放）。 */
+function bindLifecycle(ctx, register) {
+  return typeof ctx.effect === 'function' ? ctx.effect(register) : register()
+}
+
+/**
+ * 插件入口。
+ * @param {import('@deepseek-ai/cordis').Context} ctx
+ * @param {object} config
+ */
+export function apply(ctx, config) {
+  const cfg = normalizeConfig(config)
+  const webServer = ctx.webServer || (typeof ctx.get === 'function' ? ctx.get('webServer') : undefined)
+  if (!webServer || typeof webServer.register !== 'function') return
+
+  const handlers = {
+    [ROUTES.search]: async (req, res) => {
+      let params = {}
+      try {
+        const url = new URL(req.url || '/', 'http://localhost')
+        params = {
+          q: url.searchParams.get('q') || '',
+          types: url.searchParams.get('types') || undefined,
+          limit: Number(url.searchParams.get('limit') || '') || undefined,
+        }
+      } catch {
+        /* 解析失败按空查询处理 */
+      }
+      recordRequest(req, { path: 'search', q: String(params.q || '').slice(0, 50) })
+      const payload = await searchFeishu(params, cfg)
+      jsonResponse(res, payload)
+    },
+    [ROUTES.status]: async (_req, res) => {
+      recordRequest(_req, { path: 'status' })
+      const payload = await feishuStatus(cfg)
+      jsonResponse(res, { ...payload, lastRequests: requestLog.slice(-20) })
+    },
+  }
+
+  bindLifecycle(ctx, () => {
+    const disposers = []
+    for (const [path, handler] of Object.entries(handlers)) {
+      const wrapped = (req, res) => {
+        Promise.resolve(handler(req, res)).catch((error) => {
+          try {
+            jsonResponse(res, { ok: true, items: [], warnings: [String(error?.message || error)] })
+          } catch {
+            /* 响应已结束 */
+          }
+        })
+      }
+      disposers.push(webServer.register({ kind: 'exact', path, handler: wrapped }))
+    }
+    return () => {
+      for (const dispose of disposers) {
+        try {
+          dispose()
+        } catch {
+          /* 已释放 */
+        }
+      }
+    }
+  })
+}
+
+export default { name, inject, apply }

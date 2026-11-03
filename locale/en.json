@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Feishu @ Mentions",
+    "description": "Type @ in the composer to fuzzy-search Feishu users, group chats and departments; picking one inserts a name chip, and the model receives the name, ID and ID type."
+  }
+}

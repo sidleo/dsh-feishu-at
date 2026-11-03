@@ -1,0 +1,56 @@
+{
+  "name": "@sidleo3/dsh-feishu-at",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "DSH 输入框飞书 @ 提及：@ 后模糊搜索飞书用户 / 群聊 / 部门，选中即插入名称块，模型侧附带名称、ID 与 ID 类型。",
+  "keywords": [
+    "deepseek-harness",
+    "dsh",
+    "dsh-plugin",
+    "feishu",
+    "lark",
+    "mention"
+  ],
+  "license": "MIT",
+  "icon": "./icon.svg",
+  "main": "./index.js",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "icon.svg",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=18.0.0",
+    "dsh": ">=0.2.1-rc.3"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true
+    }
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/sidleo/dsh-feishu-at.git"
+  },
+  "homepage": "https://github.com/sidleo/dsh-feishu-at#readme",
+  "bugs": {
+    "url": "https://github.com/sidleo/dsh-feishu-at/issues"
+  }
+}
