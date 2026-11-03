@@ -17,7 +17,7 @@
 |------|------|
 | DSH `>= 0.2.1-rc.3` | 依赖内置的输入触发流水线（`dsh-client-ui-input-trigger`）与 `webServer` 路由 |
 | `lark-cli`（本机 `~/.local/bin/lark-cli`） | 已用 **user 身份**登录：`lark-cli auth login`。插件会自动在 PATH 之外回退查找 `~/.local/bin`、`/opt/homebrew/bin`、`/usr/local/bin` |
-| 部门名称（可选） | 部门名称要 `contact:department.base:readonly` 读权限（`--domain contact` 不含它）。执行 `lark-cli auth login --scope contact:department.base:readonly` 授权后重载插件即可；未授权时部门行只显示 `open_department_id` |
+| 部门名称（可选） | 部门名称要 `contact:department.base:readonly` 读权限（`--domain contact` 不含它）。未授权时部门行只显示 `open_department_id`，菜单里同时给出授权命令 |
 
 ## 安装
 
@@ -31,6 +31,31 @@ dsh plugin --profile desktop add link:/绝对路径/dsh-feishu-at
 
 安装后重启 DSH 加载 Host 半，并刷新浏览器页面加载 Client 半。
 若 profile 用显式 bundles 清单（`package.json` → `dsh.profile.bundles`），把 `@sidleo3/dsh-feishu-at` 加进去。
+
+## 缺授权怎么办
+
+插件**不会因为缺 lark-cli / 未登录 / 缺 scope 而报错或消失**：`@` 菜单会多出一组
+「飞书授权 / 配置」提示行，标题说明缺什么，右侧描述给出可直接执行的命令（选中提示行不会插入内容）。
+先按提示行处理，再按需刷新页面或重启 DSH。
+
+| 提示行 | 含义 | 在系统终端执行 |
+|---|---|---|
+| 未安装 lark-cli | 本机找不到 `lark-cli` | `npm i -g @larksuite/cli && lark-cli config init && lark-cli auth login`，然后重启 DSH |
+| lark-cli 未配置飞书应用 | 没有 app-id / app-secret | `lark-cli config init`（填 app-id 与 app-secret），再 `lark-cli auth login` |
+| 飞书未登录 | user 身份不可用或已过期 | `lark-cli auth login`（按提示打开验证链接完成授权） |
+| 飞书授权缺少 scope | 登录身份没覆盖某个接口所需权限 | 按提示行里的命令执行，如 `lark-cli auth login --scope "contact:department.base:readonly"`；scope 名来自 lark-cli 报错的 `missing_scopes` |
+| 部门名称无权限 | 只缺部门名（部门行降级为 ID） | `lark-cli auth login --scope contact:department.base:readonly` |
+
+> 授权命令要在**系统终端**里跑，不要粘到 DSH 的浏览器地址栏。改 Host 半后需重启 DSH；
+> 只刷新页面只影响 Client 半。
+
+一次性自查（把端口换成你当前 DSH Web GUI 的端口）：
+
+```bash
+curl -s 'http://127.0.0.1:<DSH Web 端口>/api/dsh-feishu-at/status' | python3 -m json.tool
+```
+
+`status` 里的 `cli.found` / `auth.ready` 是能力结论，`issues[]` 是当前问题清单（`kind` / `title` / `detail` / `fix` / 可选 `scopes`），`fix` 就是上表第三列的命令。
 
 ## 使用
 
@@ -65,6 +90,9 @@ icon.svg        插件图标
 
 - Host 路由：`GET /api/dsh-feishu-at/search?q=&types=user,chat,dept&limit=8`、`GET /api/dsh-feishu-at/status`。
   `/status` 的 `lastRequests` 是最近 20 条请求的观测（时间 / q / User-Agent / Referer），可用来确认浏览器半是否真的在调路由。
+- 「永不 500」+「缺授权可见」：两个路由都返回 200，失败不以异常表达，而是回 `issues[]`
+  （`kind`：`cli-missing` / `not-configured` / `auth-required` / `scope-missing` / `dept-names` / `search-failed`；
+  `scope-missing` 带 `scopes`）。Client 把 `issues` 渲染成菜单提示行，选中返回 `'handled'`（不插入内容）。
 - Client 只依赖 baseline 的 `react` 模块，无构建步骤、无 npm 依赖。
 - 引用块 `appearance` 省略 → 输入框内显示 `@` + 名称；发送时按 `source:'feishu'` 路由到本插件的 `codec.serialize`。
 
@@ -72,7 +100,8 @@ icon.svg        插件图标
 
 | 现象 | 处理 |
 |------|------|
-| 敲 `@` 只有文件/会话，没有飞书分组 | `curl -s 'http://127.0.0.1:<DSH Web 端口>/api/dsh-feishu-at/status'` 看 `cli.found` / `auth.ready`；Host 半改动需重启 DSH 才生效 |
+| 敲 `@` 只有文件/会话，没有飞书分组 | 看菜单里是否有「飞书授权 / 配置」提示行；没有则 `curl -s 'http://127.0.0.1:<DSH Web 端口>/api/dsh-feishu-at/status'` 看 `cli.found` / `auth.ready` / `issues`；Host 半改动需重启 DSH 才生效 |
+| 提示行「飞书 @ 提及未就绪」 | Host 路由 404：插件没启用或 Host 半没加载，确认 plugins/profile bundles 后重启 DSH |
 | `cli.found=false` | 装好 lark-cli 或在配置里指定 `larkCliPath` |
 | `auth.ready=false` | `lark-cli auth login`（user 身份） |
 | 部门行只显示 `od-…` | `lark-cli auth login --scope contact:department.base:readonly` 授权后重载本插件（插件页关一下再开）或重启 DSH |

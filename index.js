@@ -12,7 +12,7 @@
  *   并给子进程补上 lark-cli 所在目录（它常是 `#!/usr/bin/env node` 的 shim）。
  * - **交互性能**：每条 lark-cli 约 0.8–1.5s。三路并行 + 内存 TTL 缓存 + 同 key
  *   并发去重，避免每敲一个字都冷启动三次。
- * - **永不 500**：搜索路由任何失败都返回 200 + 空 items + warnings，菜单侧静默降级。
+ * - **永不 500**：搜索路由任何失败都返回 200 + 空 items + issues，菜单侧把 issue 渲染成提示行。
  * - **权限降级**：当前 user token 没有「部门基础信息」读权限（`contact:department.base:readonly`），
  *   部门搜索只回 `open_department_id`。探测一次后缓存结论，按 id 降级返回并提示授权命令。
  */
@@ -42,8 +42,97 @@ const MAX_QUERY_LENGTH = 50
 const MAX_LIMIT = 20
 const TYPES = new Set(['user', 'chat', 'dept'])
 
-const DEPT_SCOPE_HINT = '部门名称无权限：执行 `lark-cli auth login --scope contact:department.base:readonly` 授权后重载插件（或重启 DSH）'
 const LARK_MISSING_HINT = '未找到 lark-cli：安装后执行 `lark-cli auth login`，或在插件 config 里指定 larkCliPath'
+const LARK_INSTALL_FIX = 'npm i -g @larksuite/cli && lark-cli config init && lark-cli auth login'
+const LARK_LOGIN_FIX = 'lark-cli auth login'
+
+// ───────────────────────────── 安装 / 授权问题 ─────────────────────────────
+//
+// 其他用户装本插件时最常见的失败不是代码错，而是本机 lark-cli 不存在、没配飞书应用、
+// 没登录、或登录的 user 授权缺 scope。Host 把这类失败归成结构化的 issue 交给
+// client 渲染成菜单里的提示行（选中无动作），用户就知道该跑哪条命令；搜索路由
+// 「永不 500」的契约保持不变。
+
+/**
+ * 生成一条可展示/可自查的 issue。
+ * @param {string} kind - 机器可读分类：cli-missing | not-configured | auth-required | scope-missing | dept-names | search-failed | route-missing
+ * @param {string} title - 菜单提示行的标题
+ * @param {string} detail - 一行细节（报错原文摘要）
+ * @param {string} fix - 可直接复制执行的修复命令/步骤
+ * @param {string[]} [scopes] - 缺失的 scope 清单
+ * @returns {{kind: string, title: string, detail: string, fix: string, scopes?: string[]}}
+ */
+function makeIssue(kind, title, detail, fix, scopes) {
+  const issue = { kind, title, detail: String(detail || '').trim().slice(0, 200), fix }
+  if (Array.isArray(scopes) && scopes.length) issue.scopes = scopes
+  return issue
+}
+
+/** lark-cli 不存在。 */
+function cliMissingIssue() {
+  return makeIssue('cli-missing', '未安装 lark-cli', '本机找不到 lark-cli，插件无法搜索飞书目录', LARK_INSTALL_FIX)
+}
+
+/** 部门名称缺 scope（非致命，部门行降级为 ID）。 */
+function deptScopeIssue() {
+  return makeIssue('dept-names', '部门名称无权限', '当前授权缺少部门读权限，部门行只显示 open_department_id', 'lark-cli auth login --scope contact:department.base:readonly', ['contact:department.base:readonly'])
+}
+
+/**
+ * 把 lark-cli 的失败归成结构化 issue。
+ * @param {string} [text] - stderr/输出原文
+ * @param {any} [json] - 解析到的错误信封 `{ok:false,error:{...}}`
+ * @param {{missing?: boolean}} [flags]
+ * @returns {{kind: string, title: string, detail: string, fix: string, scopes?: string[]}}
+ */
+function classifyLarkError(text, json, flags = {}) {
+  if (flags.missing) return cliMissingIssue()
+  const err = json && typeof json === 'object' && json.error && typeof json.error === 'object' ? json.error : null
+  const message = String(err?.message || text || 'lark-cli 执行失败').trim()
+  const scopes = Array.isArray(err?.missing_scopes) ? err.missing_scopes.filter((scope) => typeof scope === 'string' && scope) : []
+  const hay = `${err?.type || ''} ${err?.subtype || ''} ${message} ${text || ''}`.toLowerCase()
+  if (scopes.length || hay.includes('does not cover the required scope') || hay.includes('missing_scope')) {
+    return makeIssue(
+      'scope-missing',
+      '飞书授权缺少 scope',
+      scopes.length ? `缺少：${scopes.join('、')}` : message,
+      scopes.length ? `lark-cli auth login --scope "${scopes.join(' ')}"` : 'lark-cli auth login --scope "<报错中的 scope>"',
+      scopes,
+    )
+  }
+  if (/config init|not configured|invalid_config|app[ _-]?id/.test(hay)) {
+    return makeIssue('not-configured', 'lark-cli 未配置飞书应用', message, 'lark-cli config init（填 app-id / app-secret，再 lark-cli auth login）')
+  }
+  if (/auth login|not logged in|no current user identity|token_missing|token_invalid|session expired|no user token|needs user identity/.test(hay)) {
+    return makeIssue('auth-required', '飞书未登录', message, LARK_LOGIN_FIX)
+  }
+  return makeIssue('search-failed', '飞书搜索失败', message, '')
+}
+
+/**
+ * 清空进程内缓存与探测结论（测试用；不影响运行期行为）。
+ */
+export function resetForTests() {
+  searchCache.clear()
+  statusCache.clear()
+  state.deptNames = { value: undefined, at: 0 }
+  state.lastIssues = null
+  requestLog.length = 0
+}
+
+/** issue 去重（同 kind + 同 fix 视为同一条）。 */
+function dedupeIssues(issues) {
+  const seen = new Set()
+  const out = []
+  for (const issue of issues) {
+    if (!issue) continue
+    const key = `${issue.kind}|${issue.fix}`
+    if (seen.has(key)) continue
+    seen.add(key)
+    out.push(issue)
+  }
+  return out
+}
 
 // ───────────────────────────── lark-cli 进程 ─────────────────────────────
 
@@ -154,20 +243,16 @@ function runLark(args, opts = {}) {
 }
 
 /**
- * 解包 lark-cli 的 `{ok, data}` 信封。
- * @param {{ok: boolean, json: any, error?: string}} res
- * @returns {{ok: boolean, data?: any, error?: string}}
+ * 解包 lark-cli 的 `{ok, data}` 信封；失败统一转成结构化 issue。
+ * @param {{ok: boolean, json: any, error?: string, missing?: boolean}} res
+ * @returns {{ok: true, data: any} | {ok: false, issue: object}}
  */
 function unwrap(res) {
-  if (!res.ok) return { ok: false, error: res.error || 'lark-cli 执行失败' }
+  if (!res.ok) return { ok: false, issue: classifyLarkError(res.error, res.json, { missing: res.missing }) }
   const json = res.json
-  if (json && json.ok === false) {
-    const err = json.error
-    const message = err && (err.message || err.type) ? String(err.message || err.type) : 'lark-cli 返回失败'
-    return { ok: false, error: message }
-  }
+  if (json && json.ok === false) return { ok: false, issue: classifyLarkError(null, json) }
   if (json && typeof json === 'object' && 'data' in json) return { ok: true, data: json.data }
-  return { ok: false, error: 'lark-cli 返回格式异常' }
+  return { ok: false, issue: makeIssue('search-failed', '飞书搜索失败', 'lark-cli 返回格式异常', '') }
 }
 
 // ───────────────────────────── 缓存 ─────────────────────────────
@@ -241,7 +326,7 @@ async function searchUsers(q, limit, cfg) {
     { bin: cfg.larkCliPath, timeoutMs: cfg.timeoutMs },
   )
   const unwrapped = unwrap(res)
-  if (!unwrapped.ok) return { items: [], error: unwrapped.error }
+  if (!unwrapped.ok) return { items: [], issue: unwrapped.issue }
   const users = Array.isArray(unwrapped.data?.users) ? unwrapped.data.users : []
   const items = []
   for (const user of users) {
@@ -284,7 +369,7 @@ async function searchChats(q, limit, cfg) {
     { bin: cfg.larkCliPath, timeoutMs: cfg.timeoutMs },
   )
   const unwrapped = unwrap(res)
-  if (!unwrapped.ok) return { items: [], error: unwrapped.error }
+  if (!unwrapped.ok) return { items: [], issue: unwrapped.issue }
   const chats = Array.isArray(unwrapped.data?.chats) ? unwrapped.data.chats : []
   const items = chats.map(mapChat).filter(Boolean).slice(0, limit)
   return { items }
@@ -297,7 +382,7 @@ async function recentChats(limit, cfg) {
     { bin: cfg.larkCliPath, timeoutMs: cfg.timeoutMs },
   )
   const unwrapped = unwrap(res)
-  if (!unwrapped.ok) return { items: [], error: unwrapped.error }
+  if (!unwrapped.ok) return { items: [], issue: unwrapped.issue }
   const data = unwrapped.data
   const chats = Array.isArray(data?.chats) ? data.chats : Array.isArray(data?.items) ? data.items : []
   const items = chats
@@ -318,7 +403,7 @@ async function searchDepartments(q, limit, cfg, state) {
     { bin: cfg.larkCliPath, timeoutMs: cfg.timeoutMs },
   )
   const unwrapped = unwrap(res)
-  if (!unwrapped.ok) return { items: [], error: unwrapped.error }
+  if (!unwrapped.ok) return { items: [], issue: unwrapped.issue }
   const raw = Array.isArray(unwrapped.data?.items) ? unwrapped.data.items : []
   const rows = raw
     .map((row) => ({
@@ -330,7 +415,7 @@ async function searchDepartments(q, limit, cfg, state) {
     .slice(0, limit)
   if (rows.length === 0) return { items: [] }
 
-  const warnings = []
+  const issues = []
   const allNamed = rows.every((row) => row.name !== null)
   let namesAvailable = state.deptNames.value
   if (allNamed) {
@@ -343,7 +428,7 @@ async function searchDepartments(q, limit, cfg, state) {
     state.deptNames.value = namesAvailable
     state.deptNames.at = Date.now()
   }
-  if (namesAvailable === false) warnings.push(DEPT_SCOPE_HINT)
+  if (namesAvailable === false) issues.push(deptScopeIssue())
 
   /** 部门行描述：成员数（有则带）+ ID。 */
   const describe = (row) => {
@@ -366,7 +451,7 @@ async function searchDepartments(q, limit, cfg, state) {
       ...(name ? {} : { nameAuthorized: false }),
     })
   }
-  return { items, warnings }
+  return { items, issues }
 }
 
 /** 探测部门详情里是否带 name（一次调用即可确定整片权限）。 */
@@ -391,7 +476,7 @@ async function fetchDepartmentName(id, cfg) {
 /** 每进程一份缓存与部门权限结论。 */
 const searchCache = new TimedCache()
 const statusCache = new TimedCache()
-const state = { deptNames: { value: undefined, at: 0 } }
+const state = { deptNames: { value: undefined, at: 0 }, lastIssues: null }
 /** 最近请求观察（调试：确认浏览器半是否真的在调本插件路由），最多 20 条。 */
 const requestLog = []
 
@@ -420,9 +505,11 @@ function deptNamesValue() {
 
 /**
  * 搜索入口（路由与测试共用；永不 reject）。
+ * 除候选外还带 `issues`：其他用户缺 lark-cli / 未登录 / 缺 scope 时，
+ * client 会把它渲染成菜单里的提示行（选中无动作）。
  * @param {{q?: string, types?: string, limit?: number}} params
  * @param {object} cfg - normalizeConfig 的结果
- * @returns {Promise<{ok: true, q: string, items: any[], warnings: string[], recent?: boolean}>}
+ * @returns {Promise<{ok: true, q: string, items: any[], issues: object[], warnings: string[], recent?: boolean}>}
  */
 export async function searchFeishu(params, cfg) {
   const q = String(params.q || '').trim().slice(0, MAX_QUERY_LENGTH)
@@ -437,16 +524,12 @@ export async function searchFeishu(params, cfg) {
     try {
       return await searchCache.get(`recent|${limit}`, RECENT_CACHE_TTL_MS, async () => {
         const recent = await recentChats(limit, cfg)
-        return {
-          ok: true,
-          q: '',
-          recent: true,
-          items: recent.items || [],
-          warnings: recent.error ? [recent.error] : [],
-        }
+        const issues = dedupeIssues([recent.issue])
+        rememberIssues(issues)
+        return { ok: true, q: '', recent: true, items: recent.items || [], issues, warnings: issuesToWarnings(issues) }
       })
     } catch (error) {
-      return { ok: true, q: '', recent: true, items: [], warnings: [String(error?.message || error)] }
+      return { ok: true, q: '', recent: true, items: [], issues: [], warnings: [String(error?.message || error)] }
     }
   }
 
@@ -459,27 +542,41 @@ export async function searchFeishu(params, cfg) {
       if (types.includes('dept')) jobs.push(searchDepartments(q, limit, cfg, state))
       const settled = await Promise.allSettled(jobs)
       const items = []
-      const warnings = []
+      const issues = []
       for (const result of settled) {
         if (result.status === 'rejected') {
-          warnings.push(String(result.reason?.message || result.reason))
+          issues.push(makeIssue('search-failed', '飞书搜索失败', String(result.reason?.message || result.reason), ''))
           continue
         }
         items.push(...(result.value.items || []))
-        warnings.push(...(result.value.warnings || []))
-        if (result.value.error) warnings.push(result.value.error)
+        issues.push(...(result.value.issues || []))
+        if (result.value.issue) issues.push(result.value.issue)
       }
       const order = { user: 0, chat: 1, dept: 2 }
       items.sort((a, b) => (order[a.type] ?? 9) - (order[b.type] ?? 9))
-      return { ok: true, q, items, warnings: [...new Set(warnings.filter(Boolean))] }
+      const deduped = dedupeIssues(issues)
+      rememberIssues(deduped)
+      return { ok: true, q, items, issues: deduped, warnings: issuesToWarnings(deduped) }
     })
   } catch (error) {
-    return { ok: true, q, items: [], warnings: [String(error?.message || error)] }
+    return { ok: true, q, items: [], issues: [], warnings: [String(error?.message || error)] }
   }
+}
+
+/** issue → 纯文本（保留旧字段，方便日志/curl 观察）。 */
+function issuesToWarnings(issues) {
+  return dedupeIssues(issues).map((issue) => `${issue.title}${issue.fix ? `：${issue.fix}` : issue.detail ? `：${issue.detail}` : ''}`)
+}
+
+/** 记住最近一次搜索发现的 issue（status 路由展示用，便于 curl 自查）。 */
+function rememberIssues(issues) {
+  state.lastIssues = { at: Date.now(), issues: dedupeIssues(issues) }
 }
 
 /**
  * 插件状态（路由与测试共用；永不 reject）。
+ * 供 README 排障与 curl 自查：是否找到 lark-cli、user 身份是否就绪、
+ * 最近一次搜索发现的问题、以及可直接执行的修复命令。
  * @param {object} cfg
  * @returns {Promise<object>}
  */
@@ -488,26 +585,47 @@ export async function feishuStatus(cfg) {
     return await statusCache.get('status', STATUS_CACHE_TTL_MS, async () => {
       const lark = resolveLarkCli(cfg.larkCliPath)
       const result = await runLark(['auth', 'status'], { bin: cfg.larkCliPath, timeoutMs: cfg.timeoutMs })
-      const warnings = []
-      let auth = { ready: false, identity: null, userName: null, openId: null }
-      const json = result.json
-      if (result.ok && json && typeof json === 'object') {
+      const issues = []
+      let auth = { ready: false, identity: null, userName: null, openId: null, expiresAt: null, tokenStatus: null }
+      const json = result.ok && result.json && typeof result.json === 'object' ? result.json : null
+      if (json) {
         const user = json.identities && json.identities.user
         auth = {
           ready: user?.status === 'ready',
           identity: json.identity ?? null,
           userName: user?.userName ?? null,
           openId: user?.openId ?? null,
+          expiresAt: user?.expiresAt ?? null,
+          tokenStatus: user?.tokenStatus ?? null,
+        }
+        if (!auth.ready) {
+          issues.push(makeIssue('auth-required', '飞书未登录', user?.message || 'lark-cli 的用户身份不可用', LARK_LOGIN_FIX))
         }
       } else {
-        warnings.push(result.error || 'lark-cli auth status 执行失败')
+        issues.push(classifyLarkError(result.error, result.json, { missing: !lark.found }))
       }
       const departmentNames = deptNamesValue()
-      if (departmentNames === false) warnings.push(DEPT_SCOPE_HINT)
-      return { ok: true, cli: { found: lark.found, bin: lark.found ? lark.bin : null }, auth, departmentNames, warnings }
+      if (departmentNames === false) issues.push(deptScopeIssue())
+      const recent = state.lastIssues && Date.now() - state.lastIssues.at < 5 * 60_000 ? state.lastIssues.issues : []
+      const merged = dedupeIssues([...issues, ...recent])
+      return {
+        ok: true,
+        cli: { found: lark.found, bin: lark.found ? lark.bin : null },
+        auth,
+        departmentNames,
+        issues: merged,
+        warnings: issuesToWarnings(merged),
+      }
     })
   } catch (error) {
-    return { ok: true, cli: { found: false, bin: null }, auth: { ready: false }, departmentNames: null, warnings: [String(error?.message || error)] }
+    return {
+      ok: true,
+      cli: { found: false, bin: null },
+      auth: { ready: false, identity: null, userName: null, openId: null, expiresAt: null, tokenStatus: null },
+      departmentNames: null,
+      issues: [],
+      warnings: [String(error?.message || error)],
+    }
   }
 }
 

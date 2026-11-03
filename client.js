@@ -53,7 +53,17 @@ window.__ModuleLoader__.load({
       }, h('path', { d: 'M2 14V5.2c0-.3.2-.6.5-.6h3c.3 0 .5.3.5.6V7h4V3.2c0-.3.2-.6.5-.6h3c.3 0 .5.3.5.6V14h-5v-2.5H7.5V14H2Zm2-1.6h1.2V11H4v1.4Zm0-2.8h1.2V8.2H4v1.4Zm0-2.8h1.2V6.4H4v.6Zm7 5.6h1.2V11H11v1.4Zm0-2.8h1.2V8.2H11v1.4Z' }))
     }
 
+    /** 授权/配置问题图标（三角感叹号）。 */
+    function WarningIcon({ size }) {
+      return h('svg', {
+        viewBox: '0 0 16 16', width: size || 14, height: size || 14,
+        fill: 'currentColor', 'aria-hidden': true,
+      }, h('path', { d: 'M8 1.6c.3 0 .6.2.8.5l6.2 11c.3.6-.1 1.3-.8 1.3H1.8c-.7 0-1.1-.7-.8-1.3l6.2-11c.2-.3.5-.5.8-.5Zm0 3.2a.8.8 0 0 0-.8.8v3.6a.8.8 0 0 0 1.6 0V5.6a.8.8 0 0 0-.8-.8Zm0 6a.9.9 0 1 0 0 1.8.9.9 0 0 0 0-1.8Z' }))
+    }
+
     const ICONS = { user: UserIcon, chat: ChatIcon, dept: DeptIcon }
+    /** 提示行标记：value 前缀，选中它不插入任何内容。 */
+    const HINT_PREFIX = 'hint:'
 
     // ── 候选取数：去抖 / 缓存 / 并发去重 / 静默降级 ────────────────────────
 
@@ -104,7 +114,11 @@ window.__ModuleLoader__.load({
             credentials: 'same-origin',
             headers: { accept: 'application/json' },
           })
-          if (!response.ok) throw new Error(`HTTP ${response.status}`)
+          if (!response.ok) {
+            const error = new Error(`HTTP ${response.status}`)
+            error.status = response.status
+            throw error
+          }
           const body = await response.json()
           remember(q, body)
           return body
@@ -149,7 +163,39 @@ window.__ModuleLoader__.load({
         })
         if (candidates.length >= MAX_ITEMS) break
       }
+      for (const issue of hintCandidates(body)) {
+        candidates.push(issue)
+        if (candidates.length >= MAX_ITEMS) break
+      }
       return candidates
+    }
+
+    /**
+     * Host 的 issues → 菜单提示行。提示行可被选中但插入不了任何内容
+     * （onPick 收到 hint: 前缀返回 'handled'），只为把「缺什么、跑哪条命令」显示出来。
+     * @param {any} body - /api/dsh-feishu-at/search 响应
+     * @returns {Array<object>}
+     */
+    function hintCandidates(body) {
+      const issues = Array.isArray(body?.issues) ? body.issues : []
+      const rows = []
+      const seen = new Set()
+      for (const issue of issues) {
+        if (!issue || typeof issue.title !== 'string' || !issue.title.trim()) continue
+        const key = `${issue.kind || ''}|${issue.title}`
+        if (seen.has(key)) continue
+        seen.add(key)
+        rows.push({
+          name: issue.title,
+          label: issue.title,
+          description: String(issue.fix || issue.detail || '').trim() || undefined,
+          icon: WarningIcon,
+          section: '飞书授权 / 配置',
+          value: `${HINT_PREFIX}${issue.kind || 'issue'}`,
+        })
+        if (rows.length >= 2) break
+      }
+      return rows
     }
 
     /** 模型可见的提及文本：名称 + ID + ID 类型。 */
@@ -188,7 +234,19 @@ window.__ModuleLoader__.load({
           const body = await loadSearch(q)
           if (signal && signal.aborted) return []
           return toCandidates(body)
-        } catch {
+        } catch (error) {
+          // 路由 404 = Host 半没加载（插件未启用/未重启）：给一条可动作的提示；
+          // 其余网络抖动保持静默，不干扰文件/会话候选。
+          if (error && error.status === 404) {
+            return [{
+              name: '飞书 @ 提及未就绪',
+              label: '飞书 @ 提及未就绪',
+              description: 'Host 半未加载：确认插件已启用并重启 DSH',
+              icon: WarningIcon,
+              section: '飞书授权 / 配置',
+              value: `${HINT_PREFIX}route-missing`,
+            }]
+          }
           return []
         }
       },
@@ -204,6 +262,7 @@ window.__ModuleLoader__.load({
        * 省略 appearance → 输入框内显示 `@` + 名称；提交时按 source 路由 codec。
        */
       onPick({ candidate }) {
+        if (typeof candidate.value === 'string' && candidate.value.startsWith(HINT_PREFIX)) return 'handled'
         const parsed = parseRef(candidate.value)
         if (!parsed) return undefined
         return {

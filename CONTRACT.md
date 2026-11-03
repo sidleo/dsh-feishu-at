@@ -57,26 +57,47 @@
       { "type": "chat", "name": "项目协作群", "id": "oc_xxxx...", "idType": "chat_id", "description": "chat_id oc_xxxx..." },
       { "type": "dept", "name": "测试部门", "id": "od-xxxx...", "idType": "open_department_id", "description": "open_department_id od-xxxx..." }
     ],
+    "issues": [],
     "warnings": []
   }
   ```
-  顺序：user → chat → dept。失败也要 200 + `ok:true` + 空 items + warnings（菜单静默降级，不弹错误 UI）。
+  顺序：user → chat → dept。失败也要 200 + `ok:true` + 空 items + `issues`（不弹错误 UI、不 500）。
 - `q` 为空（一敲 `@` 就出菜单）：只返回最近群聊（`lark-cli im +chat-list --types group --sort active_time --page-size <limit> --as user --format json`），
   type=chat，section 用「最近群聊」。不要返回部门/用户。
 - user 行 description：`<部门末段或末两段> · open_id <id>`；无部门时 `open_id <id>`。
 - chat 行 description：`chat_id <id>`（有 description 字段时可在前面加 `群描述 · `）。
-- dept 行 description：`open_department_id <id>`；名称拿不到时 `name` 用 id 本身，description 后缀加「（部门名称需 lark-cli auth login --domain contact 授权）」并在 warnings 里带一条。
+- dept 行 description：`open_department_id <id>`；名称拿不到时 `name` 用 id 本身，description 后缀加「（名称需授权）」，并在 `issues` 里带一条 `kind: 'dept-names'`。
 - 过滤：跳过 name 为空的用户/群（群 p2p 无名）。`is_cross_tenant: true` 的用户照收，name 后不加标记（description 里已带 id）。
 
 ### GET `/api/dsh-feishu-at/status`
 
 ```json
 { "ok": true, "cli": { "found": true, "bin": "~/.local/bin/lark-cli" },
-  "auth": { "ready": true, "identity": "user", "userName": "张三", "openId": "ou_..." },
-  "departmentNames": false, "warnings": ["部门名称无权限：lark-cli auth login --domain contact"] }
+  "auth": { "ready": true, "identity": "user", "userName": "张三", "openId": "ou_...",
+            "expiresAt": "2026-11-03T20:56:40+08:00", "tokenStatus": "valid" },
+  "departmentNames": false,
+  "issues": [ { "kind": "dept-names", "title": "部门名称无权限", "detail": "...", "fix": "lark-cli auth login --scope contact:department.base:readonly", "scopes": ["contact:department.base:readonly"] } ],
+  "warnings": ["部门名称无权限：lark-cli auth login --scope contact:department.base:readonly"] }
 ```
-`lark-cli auth status --format json` 的输出：顶层 `identities.user.status === 'ready'` 即 ready（见下）。
-`found:false` 时其余字段允许为 null/空数组，不抛 500。
+`lark-cli auth status` 输出**裸 JSON**（没有 `{ok,data}` 信封，也不需要 `--format`）：顶层 `identities.user.status === 'ready'` 即 ready。
+`found:false` 时其余字段允许为 null/空数组，不抛 500。`issues` 里额外合并最近 5 分钟搜索发现的问题，方便一条 curl 自查。
+
+### issues 契约（缺授权的可见通道）
+
+两个路由都返回 200，失败一律表达为 `issues[]`，每条：
+`{ kind, title, detail, fix, scopes? }`。
+
+| kind | 触发 | fix（给用户照抄的命令） |
+|---|---|---|
+| `cli-missing` | 本机找不到 lark-cli | `npm i -g @larksuite/cli && lark-cli config init && lark-cli auth login` |
+| `not-configured` | lark-cli 没配 app-id/app-secret | `lark-cli config init`（再 `lark-cli auth login`） |
+| `auth-required` | 未登录 / user token 过期 / 无 user 身份 | `lark-cli auth login` |
+| `scope-missing` | lark-cli 报 `error.subtype === 'missing_scope'` | `lark-cli auth login --scope "<missing_scopes 空格拼接>"`，并把 `scopes` 原样带出 |
+| `dept-names` | 部门名探测失败 | `lark-cli auth login --scope contact:department.base:readonly` |
+| `search-failed` | 其它失败 | 空串（只展示 detail） |
+
+规则：`kind` 决定分类，`title` 是菜单提示行标题，`fix` 是可直接执行的命令；同 `kind+fix` 去重。
+分类依据是 lark-cli 的错误信封（`error.type/subtype/message/missing_scopes`）与输出文本，不要硬编码 scope 清单。
 
 ### lark-cli 调用（全部 `--as user`，输出都是 JSON 信封 `{ ok, data }`）
 
@@ -96,7 +117,9 @@
 4. 最近群聊：`lark-cli im +chat-list --types group --sort active_time --page-size <limit> --as user --format json`
    → `data.items[]`（同 chats 字段）。
 - 超时：单条命令 8s（`execFile` 的 `timeout`），`maxBuffer` 32MB，`shell:false`；
-- 结果信封：`res.json.ok === false` → 视为该来源失败（warnings 记 `res.json.error.message`）。
+- 结果信封：`res.json.ok === false` → 视为该来源失败，交给 `classifyLarkError` 归成 issue。注意 lark-cli
+  **API 失败时退出码仍是 0**，必须看输出里的 `{ok:false,error:{...}}`；`error.subtype='missing_scope'` 时带
+  `missing_scopes` 数组（例：`{"error":{"type":"authorization","subtype":"missing_scope","code":99991679,"missing_scopes":["hire:job:readonly"]}}`）。
 - 缓存：内存 Map，key=`类型|q|limit`，TTL 120s（`auth status` 30s，最近群聊 60s），最多 200 条；
   并发去重（同 key 进行中复用同一 Promise）。
 - 全部来源 `Promise.allSettled` 并行；单来源失败不影响其它来源。
@@ -125,11 +148,15 @@
     - `quoted === true`（`@"...` 文件路径 token）→ `return []`；
     - 120ms 去抖（用 AbortSignal 感知取消，aborted 就 reject/return []）+ 60s 内存缓存 + 并发去重；
     - `fetch('api/dsh-feishu-at/search?q=' + encodeURIComponent(query))`（无前导 `/`；`{ signal }`）；
-    - `ok:false`/网络失败 → 返回 [] 并 `console.warn` 一次（不要抛，组静默消失）；
+    - 网络失败/非 404 → 返回 [] 并 `console.warn` 一次（不要抛，组静默消失）；
+    - HTTP 404（Host 半没加载）→ 返回一条提示行 `飞书 @ 提及未就绪`（section `飞书授权 / 配置`）；
+    - 响应带 `issues[]` → 在真实候选后追加最多 2 条提示行：`{ name: issue.title, label: issue.title,
+      description: issue.fix || issue.detail, icon: WarningIcon, section: '飞书授权 / 配置', value: 'hint:' + issue.kind }`；
     - 映射：`{ name: item.name, label: item.name, description: item.description,
       icon: ICONS[item.type], section: SECTION[item.type], value: JSON.stringify({ t:item.type, id:item.id, n:item.name, idType:item.idType }) }`
       section：`user→'飞书用户'`、`chat→'飞书群聊'`、`dept→'飞书部门'`；注意响应 items 可能超过 20 条，取前 20 即可。
-  - `onPick({ candidate })`：解析 `candidate.value` → `{ insert: { source:'feishu', ref: JSON.stringify(p), label: p.n,
+  - `onPick({ candidate })`：`candidate.value` 以 `hint:` 开头 → 返回 `'handled'`（提示行只做展示，**不插入内容**）；
+      否则解析 `candidate.value` → `{ insert: { source:'feishu', ref: JSON.stringify(p), label: p.n,
       clipboardText: '@' + p.n } }`（**不要给 appearance**；块的显示 = `@` + 名称）。
   - `codec`：
     - `clipboardText(ref)` → `'@' + parse(ref).n`
@@ -143,6 +170,7 @@
 ## 3. 联调与验收（Lead 负责，开发者自查）
 
 - 写完后 `node --check index.js` / `node --check client.js`（client.js 顶层是浏览器 API 也照样能过语法检查）。
+- 测试：`node --test "test/*.test.mjs"`（Host 用假 lark-cli 桩覆盖缺 CLI / 未登录 / 缺 scope / 部门无权限；Client 用假 ModuleLoader + fetch 覆盖提示行渲染与选中无动作）。
 - Host 半可在 /tmp 写临时脚本 `node -e` 直接调本文件导出的私有函数（如果导出）或用 `curl` 在装好后验证：
   `curl -s 'http://127.0.0.1:<DSH Web 端口>/api/dsh-feishu-at/search?q=%E5%BC%A0'`。
 - 浏览器验收由 Lead 用 GUI 完成（敲 `@`、模糊搜索、选中、发送，看串）。
