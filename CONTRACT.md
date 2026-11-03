@@ -51,11 +51,11 @@
         "name": "张三",
         "id": "ou_xxxx...",
         "idType": "open_id",
-        "description": "测试部门 · open_id ou_xxxx...",
+        "description": "某小组 · open_id ou_xxxx...",
         "department": "某集团-某中心-某部门-某小组-分部"
       },
       { "type": "chat", "name": "项目协作群", "id": "oc_xxxx...", "idType": "chat_id", "description": "chat_id oc_xxxx..." },
-      { "type": "dept", "name": "测试部门", "id": "od-xxxx...", "idType": "open_department_id", "description": "open_department_id od-xxxx..." }
+      { "type": "dept", "name": "某部门", "id": "od-xxxx...", "idType": "open_department_id", "description": "open_department_id od-xxxx..." }
     ],
     "issues": [],
     "warnings": []

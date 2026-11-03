@@ -7,7 +7,7 @@
 - 发送给模型时，块被序列化为带 **名称 + ID + ID 类型** 的文本，例如：
   - `@张三（飞书用户，open_id=ou_xxxx…）`
   - `@项目协作群（飞书群聊，chat_id=oc_xxxx…）`
-  - `@测试部门（飞书部门，open_department_id=od-xxxx…）`
+  - `@某部门（飞书部门，open_department_id=od-xxxx…）`
 - 一敲 `@`（还没输入字符）时先展示**最近群聊**，回车即可选中；
 - 候选按「飞书用户 / 飞书群聊 / 飞书部门」分节，行尾显示 ID 类型 + ID，方便区分同名用户。
 
@@ -72,7 +72,7 @@ curl -s 'http://127.0.0.1:<DSH Web 端口>/api/dsh-feishu-at/status' | python3 -
 ```yaml
 - id: feishu-at
   config:
-    larkCliPath: ~/.local/bin/lark-cli  # 缺省自动探测
+    larkCliPath: $HOME/.local/bin/lark-cli  # 缺省自动探测
     identity: user                                   # 目前只支持 user
     timeoutMs: 8000                                  # 单条 lark-cli 超时
     cacheTtlMs: 120000                               # 搜索结果缓存 TTL

@@ -311,7 +311,7 @@ function normalizeConfig(config) {
   }
 }
 
-/** 截断部门路径，只留末两级（如「测试部门-分部」）。 */
+/** 截断部门路径，只留末两级（如「某部门-分部」）。 */
 function departmentTail(department) {
   const text = String(department || '').trim()
   if (!text) return ''
