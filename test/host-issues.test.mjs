@@ -203,3 +203,34 @@ test('搜索排序：部门 > 群聊/私聊 > 人', async () => {
   const result = await searchFeishu({ q: '甲', limit: 5 }, cfgFor(bin))
   assert.deepEqual(result.items.map((item) => item.type), ['dept', 'dept', 'chat', 'chat', 'user', 'user'])
 })
+
+test('模糊搜索包含私聊：本地会话索引按名称命中 p2p', async () => {
+  resetForTests()
+  const bin = await makeStub({ auth: OK_AUTH, users: USERS_OK, chats: CHATS_OK, recent: RECENT_OK, depts: DEPTS_OK, deptDetail: DEPT_DETAIL_DENIED })
+  const result = await searchFeishu({ q: '私聊', limit: 5 }, cfgFor(bin))
+  const p2pItems = result.items.filter((item) => item.type === 'p2p')
+  assert.equal(p2pItems.length, 1)
+  assert.equal(p2pItems[0].name, '私聊对象')
+  assert.match(p2pItems[0].description, /私聊/)
+  assert.equal(p2pItems[0].idType, 'chat_id')
+  assert.ok(result.items.some((item) => item.type === 'chat'), '服务端群聊结果仍保留')
+})
+
+test('模糊搜索命中机器人私聊：description 标出「机器人私聊」', async () => {
+  resetForTests()
+  const bin = await makeStub({ auth: OK_AUTH, users: USERS_OK, chats: CHATS_OK, recent: RECENT_OK, depts: DEPTS_OK, deptDetail: DEPT_DETAIL_DENIED })
+  const result = await searchFeishu({ q: '机器人', limit: 5 }, cfgFor(bin))
+  const bot = result.items.find((item) => item.type === 'p2p')
+  assert.ok(bot, JSON.stringify(result.items))
+  assert.equal(bot.name, '某机器人')
+  assert.match(bot.description, /机器人私聊/)
+})
+
+test('会话索引失败时退回仅服务端群聊搜索，不影响其它域', async () => {
+  resetForTests()
+  const bin = await makeStub({ auth: OK_AUTH, users: USERS_OK, chats: CHATS_OK, recent: AUTH_ERROR_ENVELOPE, depts: DEPTS_OK, deptDetail: DEPT_DETAIL_DENIED })
+  const result = await searchFeishu({ q: '测试', limit: 5 }, cfgFor(bin))
+  assert.ok(result.items.some((item) => item.type === 'chat'), '群聊仍由服务端搜索返回')
+  assert.ok(!result.items.some((item) => item.type === 'p2p'), '索引不可用时不产私聊')
+  assert.ok(result.items.some((item) => item.type === 'dept'), '部门不受影响')
+})

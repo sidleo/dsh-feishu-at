@@ -13,6 +13,8 @@
  * - **交互性能**：每条 lark-cli 约 0.8–1.5s。三路并行 + 内存 TTL 缓存 + 同 key
  *   并发去重，避免每敲一个字都冷启动三次。
  * - **永不 500**：搜索路由任何失败都返回 200 + 空 items + issues，菜单侧把 issue 渲染成提示行。
+ * - **私聊补全**：飞书的群聊搜索接口不返回私聊，模糊搜索用本地「群聊 + 私聊」会话索引
+ *   （`im +chat-list --types p2p,group`，缓存 10min、加载时预热）按名称过滤。
  * - **权限降级**：当前 user token 没有「部门基础信息」读权限（`contact:department.base:readonly`），
  *   部门搜索只回 `open_department_id`。探测一次后缓存结论，按 id 降级返回并提示授权命令。
  */
@@ -37,6 +39,12 @@ const DEFAULT_CACHE_TTL_MS = 120_000
 const STATUS_CACHE_TTL_MS = 30_000
 const RECENT_CACHE_TTL_MS = 60_000
 const DEPT_NAMES_TTL_MS = 10 * 60_000
+/** 会话全量索引（群聊 + 私聊）缓存 TTL；失败时用短 TTL 重试。 */
+const CHAT_INDEX_TTL_MS = 10 * 60_000
+const CHAT_INDEX_RETRY_TTL_MS = 60_000
+const CHAT_INDEX_TIMEOUT_MS = 20_000
+const CHAT_INDEX_PAGE_SIZE = 100
+const CHAT_INDEX_PAGE_LIMIT = 20
 const MAX_CACHE_ENTRIES = 200
 const MAX_QUERY_LENGTH = 50
 const MAX_LIMIT = 20
@@ -117,6 +125,8 @@ export function resetForTests() {
   statusCache.clear()
   state.deptNames = { value: undefined, at: 0 }
   state.lastIssues = null
+  chatIndexState = { at: 0, ttl: 0, value: [] }
+  chatIndexInflight = null
   requestLog.length = 0
 }
 
@@ -370,17 +380,101 @@ function mapChat(chat) {
   }
 }
 
-/** 按关键字搜索群聊。 */
+/**
+ * 会话全量索引（群聊 + 私聊），供模糊搜索本地过滤。
+ * `im +chat-search` 只返回群聊、不返回私聊，所以私聊要靠这份索引按名称匹配；
+ * 索引按活跃时间倒序，首次拉取约 3–4s（数百个会话），之后缓存 10 分钟；
+ * 拉取失败按空索引缓存 60s，搜索自动退回「仅服务端群聊」。
+ * @param {object} cfg
+ * @returns {Promise<any[]>} raw chats（含 chat_id / name / chat_mode / p2p_target_type）
+ */
+/** 拉取一次会话索引并入缓存；并发去重。 */
+function refreshChatIndex(cfg) {
+  if (chatIndexInflight) return chatIndexInflight
+  chatIndexInflight = (async () => {
+    // 刷新失败时保留旧索引（不要清空）；没有旧索引才用空数组等下次重试。
+    let value = chatIndexState.value || []
+    let ttl = CHAT_INDEX_RETRY_TTL_MS
+    try {
+      const res = await runLark(
+        ['im', '+chat-list', '--types', 'p2p,group', '--sort', 'active_time', '--page-all',
+          '--page-size', String(CHAT_INDEX_PAGE_SIZE), '--page-limit', String(CHAT_INDEX_PAGE_LIMIT),
+          '--as', cfg.identity, '--format', 'json'],
+        { bin: cfg.larkCliPath, timeoutMs: Math.max(cfg.timeoutMs, CHAT_INDEX_TIMEOUT_MS) },
+      )
+      const unwrapped = unwrap(res)
+      if (unwrapped.ok) {
+        const chats = Array.isArray(unwrapped.data?.chats) ? unwrapped.data.chats : []
+        value = chats.filter((chat) => chat && chat.chat_id && String(chat.name || '').trim())
+        ttl = CHAT_INDEX_TTL_MS
+      }
+    } catch {
+      /* 失败：短 TTL，下次搜索重试 */
+    }
+    chatIndexState = { at: Date.now(), ttl, value }
+    chatIndexInflight = null
+    return value
+  })()
+  return chatIndexInflight
+}
+
+/**
+ * 取会话索引：缓存有效直接返回；过期但已有数据时**先返回旧值、后台刷新**
+ * （避免每 10 分钟出现一次 3–4s 冷等待）；没有数据则同步拉取。
+ */
+async function ensureChatIndex(cfg) {
+  const now = Date.now()
+  const fresh = chatIndexState.at && now - chatIndexState.at < chatIndexState.ttl
+  if (fresh) return chatIndexState.value
+  if (chatIndexState.value.length) {
+    void refreshChatIndex(cfg).catch(() => {})
+    return chatIndexState.value
+  }
+  return refreshChatIndex(cfg)
+}
+
+/**
+ * 按关键字搜索群聊与私聊：服务端群聊搜索（能按群成员名召回）+ 本地会话索引
+ * （覆盖私聊，且按活跃度优先）。结果按「群聊 / 私聊」分开各取 limit 条。
+ */
 async function searchChats(q, limit, cfg) {
-  const res = await runLark(
-    ['im', '+chat-search', '--query', q, '--as', cfg.identity, '--format', 'json', '--page-size', String(Math.min(Math.max(limit, 1), 30))],
-    { bin: cfg.larkCliPath, timeoutMs: cfg.timeoutMs },
-  )
-  const unwrapped = unwrap(res)
-  if (!unwrapped.ok) return { items: [], issue: unwrapped.issue }
-  const chats = Array.isArray(unwrapped.data?.chats) ? unwrapped.data.chats : []
-  const items = chats.map(mapChat).filter(Boolean).slice(0, limit)
-  return { items }
+  const pageSize = String(Math.min(Math.max(limit, 1), 30))
+  const [server, indexChats] = await Promise.all([
+    runLark(['im', '+chat-search', '--query', q, '--as', cfg.identity, '--format', 'json', '--page-size', pageSize], {
+      bin: cfg.larkCliPath,
+      timeoutMs: cfg.timeoutMs,
+    }),
+    ensureChatIndex(cfg),
+  ])
+
+  const lower = q.toLowerCase()
+  const startsWith = []
+  const contains = []
+  for (const chat of indexChats) {
+    const name = String(chat.name || '').trim()
+    if (!name) continue
+    const hay = name.toLowerCase()
+    if (!hay.includes(lower)) continue
+    ;(hay.startsWith(lower) ? startsWith : contains).push(chat)
+  }
+  const localItems = [...startsWith, ...contains].map(mapChat).filter(Boolean)
+
+  const unwrapped = unwrap(server)
+  const serverItems = unwrapped.ok
+    ? (Array.isArray(unwrapped.data?.chats) ? unwrapped.data.chats : []).map(mapChat).filter(Boolean)
+    : []
+
+  const seen = new Set()
+  const merged = []
+  for (const item of [...localItems, ...serverItems]) {
+    if (!item.id || seen.has(item.id)) continue
+    seen.add(item.id)
+    merged.push(item)
+  }
+  const chats = merged.filter((item) => item.type === 'chat').slice(0, limit)
+  const p2p = merged.filter((item) => item.type === 'p2p').slice(0, limit)
+  if (merged.length === 0 && !unwrapped.ok) return { items: [], issue: unwrapped.issue }
+  return { items: [...chats, ...p2p] }
 }
 
 /**
@@ -488,6 +582,9 @@ async function fetchDepartmentName(id, cfg) {
 const searchCache = new TimedCache()
 const statusCache = new TimedCache()
 const state = { deptNames: { value: undefined, at: 0 }, lastIssues: null }
+/** 会话全量索引（群聊 + 私聊）缓存：{ at, ttl, value: rawChats[] }。 */
+let chatIndexState = { at: 0, ttl: 0, value: [] }
+let chatIndexInflight = null
 /** 最近请求观察（调试：确认浏览器半是否真的在调本插件路由），最多 20 条。 */
 const requestLog = []
 
@@ -692,6 +789,9 @@ export function apply(ctx, config) {
       jsonResponse(res, { ...payload, lastRequests: requestLog.slice(-20) })
     },
   }
+
+  // 后台预热「群聊 + 私聊」会话索引（首次约 3–4s），让第一次模糊搜索就能出私聊。
+  void ensureChatIndex(cfg).catch(() => {})
 
   bindLifecycle(ctx, () => {
     const disposers = []

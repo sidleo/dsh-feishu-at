@@ -105,8 +105,12 @@
 
 1. 用户：`lark-cli contact +search-user --query <q> --as user --format json --page-size <limit>`
    → `data.users[]`：`open_id, localized_name, department, email, is_cross_tenant, has_chatted, p2p_chat_id`。
-2. 群聊：`lark-cli im +chat-search --query <q> --as user --format json --page-size <limit>`
-   → `data.chats[]`：`chat_id, name, chat_mode, external, description`。
+2. 群聊 + 私聊（模糊搜索）：
+   - 服务端群聊搜索 `lark-cli im +chat-search --query <q> --as user --format json --page-size <limit>` → `data.chats[]`（只返群聊；可按键搜索到「成员名含 q」的群，召回比名称匹配强）。
+   - **私聊不在该接口**：插件维护本地会话索引 `lark-cli im +chat-list --types p2p,group --sort active_time --page-all --page-size 100 --page-limit 20`
+     （首次约 3–4s，缓存 10 分钟；插件加载时后台预热；过期但已有数据时先返回旧值再后台刷新；失败缓存 60s 并退回仅服务端群聊）。
+     用 `name` 小写 includes(q) 过滤，startsWith 优先；`chat_mode === 'p2p'` 的行 type=`p2p`。
+   - 两者按 chat_id 去重（本地索引优先），群聊/私聊各取 limit 条返回。
 3. 部门搜索：`lark-cli api POST /open-apis/contact/v3/departments/search --data '{"query":"<q>","page_size":<limit>}'`
    → `data.items[]` 只有 `open_department_id`。
    部门名（两种来源，优先前者）：
@@ -122,7 +126,7 @@
 - 结果信封：`res.json.ok === false` → 视为该来源失败，交给 `classifyLarkError` 归成 issue。注意 lark-cli
   **API 失败时退出码仍是 0**，必须看输出里的 `{ok:false,error:{...}}`；`error.subtype='missing_scope'` 时带
   `missing_scopes` 数组（例：`{"error":{"type":"authorization","subtype":"missing_scope","code":99991679,"missing_scopes":["hire:job:readonly"]}}`）。
-- 缓存：内存 Map，key=`类型|q|limit`，TTL 120s（`auth status` 30s，最近会话 60s），最多 200 条；
+- 缓存：内存 Map，key=`类型|q|limit`，TTL 120s（`auth status` 30s，最近会话 60s，会话索引 10min / 失败 60s），最多 200 条；
   并发去重（同 key 进行中复用同一 Promise）。
 - 全部来源 `Promise.allSettled` 并行；单来源失败不影响其它来源。
 

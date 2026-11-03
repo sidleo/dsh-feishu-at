@@ -166,3 +166,21 @@ test('最近会话：私聊与群聊按 Host 顺序混排在同一节', async ()
   assert.deepEqual(rows.map((row) => row.name), ['最近群', '私聊对象', '某机器人'])
   assert.ok(rows.every((row) => row.section === '最近会话'))
 })
+
+test('搜索结果含私聊：分节顺序 部门 > 群聊 > 私聊 > 人', async () => {
+  const body = {
+    ok: true,
+    q: '甲',
+    items: [
+      { type: 'user', name: '用户甲', id: 'ou_u1', idType: 'open_id', description: 'open_id ou_u1' },
+      { type: 'p2p', name: '私聊甲', id: 'oc_p1', idType: 'chat_id', description: '私聊 · chat_id oc_p1' },
+      { type: 'dept', name: '部门甲', id: 'od-1', idType: 'open_department_id', description: 'open_department_id od-1' },
+      { type: 'chat', name: '群甲', id: 'oc_c1', idType: 'chat_id', description: 'chat_id oc_c1' },
+    ],
+    issues: [],
+    warnings: [],
+  }
+  const source = await loadSource(jsonResponse(body))
+  const rows = await source.candidates(null, request('甲'))
+  assert.deepEqual(rows.map((row) => row.section), ['飞书部门', '飞书群聊', '飞书私聊', '飞书用户'])
+})

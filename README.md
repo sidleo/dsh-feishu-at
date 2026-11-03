@@ -9,7 +9,7 @@
   - `@项目协作群（飞书群聊，chat_id=oc_xxxx…）`
   - `@某部门（飞书部门，open_department_id=od-xxxx…）`
 - 一敲 `@`（还没输入字符）时先展示**最近会话**（群聊 + 私聊混排，按最近活跃排序），回车即可选中；
-- 输入字符搜索时按 **部门 > 群聊/私聊 > 人** 排列，每类最多显示 5 条，行尾显示 ID 类型 + ID。
+- 输入字符搜索时**群聊与私聊一起搜**（私聊靠本地会话索引按名称匹配），结果按 **部门 > 群聊 > 私聊 > 人** 排列，每类最多显示 5 条，行尾显示 ID 类型 + ID。
 
 ## 前置条件
 
@@ -64,8 +64,10 @@ curl -s 'http://127.0.0.1:<DSH Web 端口>/api/dsh-feishu-at/status' | python3 -
 3. `↑/↓` 或鼠标选择，`Enter` 或 `Tab` 选中；`Esc` 关闭。选中后输入框里是 `@名称` 块。
 4. 正常发送。模型收到的是带 ID 与 ID 类型的文本，可直接据此用 `lark-cli` 发消息、查群、查部门成员等。
 
-> 搜索走 `lark-cli contact +search-user` / `lark-cli im +chat-search` / 原生 `contact/v3/departments/search`。
-> 每条命令约 0.8–1.5s，插件在 Host 侧做了 120s 结果缓存与并发去重，重复前缀（如先 `张` 再 `张志`）会很快；首次搜索稍慢属正常。
+> 搜索走 `lark-cli contact +search-user` / `lark-cli im +chat-search`（群聊）/ 原生 `contact/v3/departments/search`；
+> 私聊（`p2p`）不在飞书的群聊搜索接口里，由插件本地维护「群聊 + 私聊」全量会话索引（`im +chat-list --types p2p,group`，
+> 首次约 3–4s，缓存 10 分钟并在后台预热/刷新）后按名称过滤。
+> 每条 lark-cli 命令约 0.8–1.5s，插件在 Host 侧做了 120s 结果缓存与并发去重，重复前缀（如先 `张` 再 `张志`）会很快；首次搜索稍慢属正常。
 
 ## 配置（可选，profile 的 `cordis.patch.yml`）
 
