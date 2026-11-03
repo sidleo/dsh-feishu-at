@@ -111,3 +111,58 @@ test('网络错误（非 404）：保持静默，不干扰其它候选组', asyn
   const rows = await source.candidates(null, request(''))
   assert.deepEqual(rows, [])
 })
+
+test('搜索结果按 部门 > 群聊/私聊 > 人 排序（不依赖 Host 顺序）', async () => {
+  const body = {
+    ok: true,
+    q: '甲',
+    items: [
+      { type: 'user', name: '用户甲', id: 'ou_u1', idType: 'open_id', description: 'open_id ou_u1' },
+      { type: 'chat', name: '群甲', id: 'oc_c1', idType: 'chat_id', description: 'chat_id oc_c1' },
+      { type: 'dept', name: '部门甲', id: 'od-1', idType: 'open_department_id', description: 'open_department_id od-1' },
+    ],
+    issues: [],
+    warnings: [],
+  }
+  const source = await loadSource(jsonResponse(body))
+  const rows = await source.candidates(null, request('甲'))
+  assert.deepEqual(rows.map((row) => row.section), ['飞书部门', '飞书群聊', '飞书用户'])
+})
+
+test('搜索结果每类最多 5 行，部门优先不被同类挤掉', async () => {
+  const users = Array.from({ length: 7 }, (_, index) => ({
+    type: 'user', name: `用户${index}`, id: `ou_${index}`, idType: 'open_id', description: 'open_id',
+  }))
+  const body = {
+    ok: true,
+    q: '甲',
+    items: [...users, { type: 'dept', name: '部门甲', id: 'od-1', idType: 'open_department_id', description: 'open_department_id od-1' }],
+    issues: [],
+    warnings: [],
+  }
+  const source = await loadSource(jsonResponse(body))
+  const rows = await source.candidates(null, request('甲'))
+  assert.equal(rows[0].section, '飞书部门')
+  const userRows = rows.filter((row) => row.section === '飞书用户')
+  assert.equal(userRows.length, 5)
+  assert.equal(rows.length, 6)
+})
+
+test('最近会话：私聊与群聊按 Host 顺序混排在同一节', async () => {
+  const body = {
+    ok: true,
+    q: '',
+    recent: true,
+    items: [
+      { type: 'chat', name: '最近群', id: 'oc_g', idType: 'chat_id', description: 'chat_id oc_g', section: '最近会话' },
+      { type: 'p2p', name: '私聊对象', id: 'oc_p', idType: 'chat_id', description: '私聊 · chat_id oc_p', section: '最近会话' },
+      { type: 'p2p', name: '某机器人', id: 'oc_b', idType: 'chat_id', description: '机器人私聊 · chat_id oc_b', section: '最近会话' },
+    ],
+    issues: [],
+    warnings: [],
+  }
+  const source = await loadSource(jsonResponse(body))
+  const rows = await source.candidates(null, request(''))
+  assert.deepEqual(rows.map((row) => row.name), ['最近群', '私聊对象', '某机器人'])
+  assert.ok(rows.every((row) => row.section === '最近会话'))
+})

@@ -23,9 +23,13 @@ window.__ModuleLoader__.load({
     const CACHE_TTL_MS = 60_000
     const MAX_CACHE_ENTRIES = 100
     const MAX_ITEMS = 20
+    /** 搜索结果每类最多显示几行（部门最优先，四类均衡，避免某一类把整屏挤满）。 */
+    const MAX_PER_TYPE = 5
 
     /** 分组小标题：按实体类型分节。 */
-    const SECTIONS = { user: '飞书用户', chat: '飞书群聊', dept: '飞书部门' }
+    const SECTIONS = { user: '飞书用户', chat: '飞书群聊', p2p: '飞书私聊', dept: '飞书部门' }
+    /** 默认顺序：部门 > 群聊/私聊 > 人。 */
+    const TYPE_ORDER = { dept: 0, chat: 1, p2p: 2, user: 3 }
 
     // ── 图标（14×14，currentColor，跟随菜单文字色）────────────────────────
 
@@ -61,7 +65,7 @@ window.__ModuleLoader__.load({
       }, h('path', { d: 'M8 1.6c.3 0 .6.2.8.5l6.2 11c.3.6-.1 1.3-.8 1.3H1.8c-.7 0-1.1-.7-.8-1.3l6.2-11c.2-.3.5-.5.8-.5Zm0 3.2a.8.8 0 0 0-.8.8v3.6a.8.8 0 0 0 1.6 0V5.6a.8.8 0 0 0-.8-.8Zm0 6a.9.9 0 1 0 0 1.8.9.9 0 0 0 0-1.8Z' }))
     }
 
-    const ICONS = { user: UserIcon, chat: ChatIcon, dept: DeptIcon }
+    const ICONS = { user: UserIcon, chat: ChatIcon, p2p: ChatIcon, dept: DeptIcon }
     /** 提示行标记：value 前缀，选中它不插入任何内容。 */
     const HINT_PREFIX = 'hint:'
 
@@ -147,12 +151,27 @@ window.__ModuleLoader__.load({
       return null
     }
 
-    /** Host 响应 items → 菜单候选。 */
+    /**
+     * Host 响应 items → 菜单候选。
+     * - 最近会话（body.recent）：保持 Host 的活跃时间顺序，最多 MAX_ITEMS 行；
+     * - 搜索结果：按「部门 > 群聊/私聊 > 人」排序，每类最多 MAX_PER_TYPE 行，
+     *   避免同类候选把菜单挤满（部门排最后时会被同名用户整片挤掉）。
+     */
     function toCandidates(body) {
-      const items = Array.isArray(body?.items) ? body.items : []
+      const raw = Array.isArray(body?.items) ? body.items : []
+      const items = raw.filter(
+        (item) => item && typeof item.name === 'string' && item.name.trim() && typeof item.id === 'string' && item.id,
+      )
+      // 最近会话保持 Host 的活跃时间顺序；搜索结果按类型优先级重排（稳定排序，同类内保持 Host 顺序）。
+      if (!body || body.recent !== true) items.sort((a, b) => (TYPE_ORDER[a.type] ?? 9) - (TYPE_ORDER[b.type] ?? 9))
       const candidates = []
+      const perType = {}
       for (const item of items) {
-        if (!item || typeof item.name !== 'string' || !item.name.trim() || typeof item.id !== 'string' || !item.id) continue
+        if (!body || body.recent !== true) {
+          const used = perType[item.type] || 0
+          if (used >= MAX_PER_TYPE) continue
+          perType[item.type] = used + 1
+        }
         candidates.push({
           name: item.name,
           label: item.name,
@@ -251,7 +270,7 @@ window.__ModuleLoader__.load({
         }
       },
 
-      /** 会话 scope 出生时预热「最近群聊」，让一敲 @ 就有内容。 */
+      /** 会话 scope 出生时预热「最近会话」，让一敲 @ 就有内容。 */
       warm() {
         if (cache.has('') && Date.now() - cache.get('').at < CACHE_TTL_MS) return
         void loadSearch('').catch(() => {})

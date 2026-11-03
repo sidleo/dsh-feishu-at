@@ -8,8 +8,8 @@
   - `@张三（飞书用户，open_id=ou_xxxx…）`
   - `@项目协作群（飞书群聊，chat_id=oc_xxxx…）`
   - `@某部门（飞书部门，open_department_id=od-xxxx…）`
-- 一敲 `@`（还没输入字符）时先展示**最近群聊**，回车即可选中；
-- 候选按「飞书用户 / 飞书群聊 / 飞书部门」分节，行尾显示 ID 类型 + ID，方便区分同名用户。
+- 一敲 `@`（还没输入字符）时先展示**最近会话**（群聊 + 私聊混排，按最近活跃排序），回车即可选中；
+- 输入字符搜索时按 **部门 > 群聊/私聊 > 人** 排列，每类最多显示 5 条，行尾显示 ID 类型 + ID。
 
 ## 前置条件
 
@@ -59,7 +59,7 @@ curl -s 'http://127.0.0.1:<DSH Web 端口>/api/dsh-feishu-at/status' | python3 -
 
 ## 使用
 
-1. 在会话输入框敲 `@`；菜单出现「最近群聊」。
+1. 在会话输入框敲 `@`；菜单出现「最近会话」（群聊 + 私聊，按最近活跃排序）。
 2. 继续输入，例如 `@张`、`@有货`、`@商品`，候选按用户/群聊/部门分节出现。
 3. `↑/↓` 或鼠标选择，`Enter` 或 `Tab` 选中；`Esc` 关闭。选中后输入框里是 `@名称` 块。
 4. 正常发送。模型收到的是带 ID 与 ID 类型的文本，可直接据此用 `lark-cli` 发消息、查群、查部门成员等。
@@ -89,6 +89,7 @@ icon.svg        插件图标
 ```
 
 - Host 路由：`GET /api/dsh-feishu-at/search?q=&types=user,chat,dept&limit=8`、`GET /api/dsh-feishu-at/status`。
+  结果顺序固定为 部门 → 群聊 → 私聊 → 人；Client 侧每类再截到 5 条（最近会话不按类截断）。
   `/status` 的 `lastRequests` 是最近 20 条请求的观测（时间 / q / User-Agent / Referer），可用来确认浏览器半是否真的在调路由。
 - 「永不 500」+「缺授权可见」：两个路由都返回 200，失败不以异常表达，而是回 `issues[]`
   （`kind`：`cli-missing` / `not-configured` / `auth-required` / `scope-missing` / `dept-names` / `search-failed`；

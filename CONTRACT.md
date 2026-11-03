@@ -62,8 +62,10 @@
   }
   ```
   顺序：user → chat → dept。失败也要 200 + `ok:true` + 空 items + `issues`（不弹错误 UI、不 500）。
-- `q` 为空（一敲 `@` 就出菜单）：只返回最近群聊（`lark-cli im +chat-list --types group --sort active_time --page-size <limit> --as user --format json`），
-  type=chat，section 用「最近群聊」。不要返回部门/用户。
+- `q` 为空（一敲 `@` 就出菜单）：返回**最近会话**（群聊 + 私聊混排，按最近活跃倒序）：
+  `lark-cli im +chat-list --types p2p,group --sort active_time --page-size <limit> --as user --format json`。
+  `chat_mode === 'p2p'` 的行 type=`p2p`（description 前缀「私聊 ·」/「机器人私聊 ·」），其余 type=`chat`；
+  section 统一用「最近会话」。不要返回部门/用户。
 - user 行 description：`<部门末段或末两段> · open_id <id>`；无部门时 `open_id <id>`。
 - chat 行 description：`chat_id <id>`（有 description 字段时可在前面加 `群描述 · `）。
 - dept 行 description：`open_department_id <id>`；名称拿不到时 `name` 用 id 本身，description 后缀加「（名称需授权）」，并在 `issues` 里带一条 `kind: 'dept-names'`。
@@ -114,13 +116,13 @@
       整片按 id 降级（description 带「名称需授权」+ warnings 给授权命令）。
    注意：`lark-cli auth login --domain contact` 不含部门读权限，必须用
    `lark-cli auth login --scope contact:department.base:readonly`。
-4. 最近群聊：`lark-cli im +chat-list --types group --sort active_time --page-size <limit> --as user --format json`
-   → `data.items[]`（同 chats 字段）。
+4. 最近会话：`lark-cli im +chat-list --types p2p,group --sort active_time --page-size <limit> --as user --format json`
+   → `data.chats[]`（含 `chat_mode: 'group' | 'p2p'`、`p2p_target_type: 'user' | 'bot'`；私聊 name 是对方/机器人名称）。
 - 超时：单条命令 8s（`execFile` 的 `timeout`），`maxBuffer` 32MB，`shell:false`；
 - 结果信封：`res.json.ok === false` → 视为该来源失败，交给 `classifyLarkError` 归成 issue。注意 lark-cli
   **API 失败时退出码仍是 0**，必须看输出里的 `{ok:false,error:{...}}`；`error.subtype='missing_scope'` 时带
   `missing_scopes` 数组（例：`{"error":{"type":"authorization","subtype":"missing_scope","code":99991679,"missing_scopes":["hire:job:readonly"]}}`）。
-- 缓存：内存 Map，key=`类型|q|limit`，TTL 120s（`auth status` 30s，最近群聊 60s），最多 200 条；
+- 缓存：内存 Map，key=`类型|q|limit`，TTL 120s（`auth status` 30s，最近会话 60s），最多 200 条；
   并发去重（同 key 进行中复用同一 Promise）。
 - 全部来源 `Promise.allSettled` 并行；单来源失败不影响其它来源。
 
@@ -154,7 +156,7 @@
       description: issue.fix || issue.detail, icon: WarningIcon, section: '飞书授权 / 配置', value: 'hint:' + issue.kind }`；
     - 映射：`{ name: item.name, label: item.name, description: item.description,
       icon: ICONS[item.type], section: SECTION[item.type], value: JSON.stringify({ t:item.type, id:item.id, n:item.name, idType:item.idType }) }`
-      section：`user→'飞书用户'`、`chat→'飞书群聊'`、`dept→'飞书部门'`；注意响应 items 可能超过 20 条，取前 20 即可。
+      section：`user→'飞书用户'`、`chat→'飞书群聊'`、`p2p→'飞书私聊'`、`dept→'飞书部门'`（item 自带 section 时优先，最近会话用「最近会话」）。
   - `onPick({ candidate })`：`candidate.value` 以 `hint:` 开头 → 返回 `'handled'`（提示行只做展示，**不插入内容**）；
       否则解析 `candidate.value` → `{ insert: { source:'feishu', ref: JSON.stringify(p), label: p.n,
       clipboardText: '@' + p.n } }`（**不要给 appearance**；块的显示 = `@` + 名称）。
@@ -163,6 +165,7 @@
     - `serialize(ref, signal)` → 用户：`` `@${n}（飞书用户，open_id=${id}）` ``；
       群聊：`` `@${n}（飞书群聊，chat_id=${id}）` ``；部门：`` `@${n}（飞书部门，open_department_id=${id}）` ``。
   - `openReference()` → `return false`（点击块不预览）。
+- 搜索结果顺序固定「部门 > 群聊/私聊 > 人」，Client 侧每类最多 `MAX_PER_TYPE = 5` 行、总计 `MAX_ITEMS = 20`；最近会话（`body.recent === true`）保持 Host 顺序、不按类截断。
 - 三个 icon：函数组件 `function Icon({ size })` 返回 14×14 的 inline svg，`fill="currentColor"`（用户=人形、群聊=对话气泡、部门=组织树/楼）。
 - 候选行 `name` 必须非空字符串；`value` 是唯一的取数通道（不要放闭包状态）。
 - 服务名用 `ctx.get('inputTriggers')`；`inject: ['inputTriggers']` 让 apply 等 service 就绪。

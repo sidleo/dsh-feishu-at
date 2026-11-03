@@ -347,18 +347,26 @@ async function searchUsers(q, limit, cfg) {
   return { items }
 }
 
-/** 群聊候选。 */
+/**
+ * 群聊 / 私聊候选。`chat_mode === 'p2p'` 的是私聊（`p2p_target_type` 为 user 或 bot），
+ * 其余按群聊处理；两者都用 chat_id 作为 ID 类型。
+ */
 function mapChat(chat) {
   const displayName = String(chat.name || '').trim()
   if (!displayName) return null
+  const chatId = String(chat.chat_id || '')
+  if (chat.chat_mode === 'p2p') {
+    const kind = chat.p2p_target_type === 'bot' ? '机器人私聊' : '私聊'
+    return { type: 'p2p', name: displayName, id: chatId, idType: 'chat_id', description: `${kind} · chat_id ${chatId}` }
+  }
   const description = String(chat.description || '').trim()
   const external = chat.external === true ? '外部群 · ' : ''
   return {
     type: 'chat',
     name: displayName,
-    id: String(chat.chat_id || ''),
+    id: chatId,
     idType: 'chat_id',
-    description: `${external}${description ? `${description.slice(0, 40)} · ` : ''}chat_id ${chat.chat_id || ''}`,
+    description: `${external}${description ? `${description.slice(0, 40)} · ` : ''}chat_id ${chatId}`,
   }
 }
 
@@ -375,10 +383,13 @@ async function searchChats(q, limit, cfg) {
   return { items }
 }
 
-/** 最近群聊（`@` 刚敲出来、q 为空时用）。 */
+/**
+ * 最近会话（`@` 刚敲出来、q 为空时用）：群聊 + 私聊混排，按 active_time 倒序。
+ * `--types p2p,group` 需要 user 身份；私聊的名称就是对方名称（或机器人名称）。
+ */
 async function recentChats(limit, cfg) {
   const res = await runLark(
-    ['im', '+chat-list', '--types', 'group', '--sort', 'active_time', '--page-size', String(Math.min(Math.max(limit, 1), 50)), '--as', cfg.identity, '--format', 'json'],
+    ['im', '+chat-list', '--types', 'p2p,group', '--sort', 'active_time', '--page-size', String(Math.min(Math.max(limit, 1), 50)), '--as', cfg.identity, '--format', 'json'],
     { bin: cfg.larkCliPath, timeoutMs: cfg.timeoutMs },
   )
   const unwrapped = unwrap(res)
@@ -388,7 +399,7 @@ async function recentChats(limit, cfg) {
   const items = chats
     .map(mapChat)
     .filter(Boolean)
-    .map((item) => ({ ...item, section: '最近群聊' }))
+    .map((item) => ({ ...item, section: '最近会话' }))
     .slice(0, limit)
   return { items }
 }
@@ -552,7 +563,8 @@ export async function searchFeishu(params, cfg) {
         issues.push(...(result.value.issues || []))
         if (result.value.issue) issues.push(result.value.issue)
       }
-      const order = { user: 0, chat: 1, dept: 2 }
+      // 默认顺序：部门 > 群聊/私聊 > 人（部门最容易被同名用户挤掉，放最前）
+      const order = { dept: 0, chat: 1, p2p: 2, user: 3 }
       items.sort((a, b) => (order[a.type] ?? 9) - (order[b.type] ?? 9))
       const deduped = dedupeIssues(issues)
       rememberIssues(deduped)
